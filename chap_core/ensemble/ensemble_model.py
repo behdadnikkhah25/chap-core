@@ -1,19 +1,18 @@
-# chap_core/ensemble/ensemble_model.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LinearRegression
 
 from chap_core.datatypes import Samples, FullData
 from chap_core.models.configured_model import ConfiguredModel
 from chap_core.models.model_template import ModelTemplate
 from chap_core.spatio_temporal_data.temporal_dataclass import DataSet
 
-from chap_core.ensemble.classes.stackedEnsemble import StackedEnsemble
+from chap_core.ensemble.classes.stackedEnsemble import StackedEnsemble  # ikke brukt, men beholdes for kompatibilitet
 
 
 @dataclass
@@ -23,309 +22,313 @@ class BaseModelSpec:
 
     - template: en ModelTemplate (for eksempel laget fra URL)
     - config:   en ModelConfiguration eller None (bruk default)
+                (kan også være dict, men da ignoreres den og default brukes)
     """
     template: ModelTemplate
     config: Any | None = None
 
 
-class EnsemblePredictor:
+class EnsembleEstimator(ConfiguredModel):
     """
-    Predictor-delen av ensemblet. Denne returneres fra EnsembleEstimator.train()
-    og brukes av backtest/evaluate_model.
+    Ensemble-estimator som bruker holdout-stacking på tidsseriehale.
     """
 
     def __init__(
         self,
-        stacked: StackedEnsemble,
-        base_predictors: list[ConfiguredModel],
-        feature_columns: list[str],
+        base_model_templates: list[ModelTemplate] | None = None,
+        base_model_specs: Sequence[BaseModelSpec] | None = None,
         target_column: str = "disease_cases",
+        inner_val_periods: int = 12,
+        meta_model: Any | None = None,
+        n_folds: int | None = None,
+        use_time_series_split: bool | None = None,
+        **kwargs: Any,
     ) -> None:
-        self._stacked = stacked
-        self._base_predictors = base_predictors
-        self._feature_columns = feature_columns
-        self._target_column = target_column
+        super().__init__()
 
-    def _dataset_to_X(self, data: DataSet) -> pd.DataFrame:
-        """
-        Konverter DataSet -> pandas.DataFrame med de samme feature-kolonnene
-        som ble brukt ved trening.
-        """
+        specs: list[BaseModelSpec] = []
+
+        if base_model_specs is not None:
+            specs.extend(list(base_model_specs))
+
+        if base_model_templates is not None:
+            for tmpl in base_model_templates:
+                specs.append(BaseModelSpec(template=tmpl, config=None))
+
+        if not specs:
+            raise ValueError("EnsembleEstimator krever minst én base-modell.")
+
+        self._base_specs = specs
+        self._target_column = target_column
+        self._inner_val_periods = inner_val_periods
+        self._meta_model = meta_model or LinearRegression()
+        self._weights_: np.ndarray | None = None
+        self._feature_columns: list[str] | None = None
+
+    @classmethod
+    def from_config(cls, spec: Any) -> "EnsembleEstimator":
+        base_specs: list[BaseModelSpec] = []
+        for bm in spec.config["base_models"]:
+            cfg = bm.get("config", None)
+            base_specs.append(
+                BaseModelSpec(
+                    template=bm["template"],
+                    config=cfg,
+                )
+            )
+        target_col = spec.config.get("target_column", "disease_cases")
+        inner_val_periods = spec.config.get("inner_val_periods", 12)
+        return cls(
+            base_model_specs=base_specs,
+            target_column=target_col,
+            inner_val_periods=inner_val_periods,
+        )
+
+    def _split_inner_train_val(self, data: DataSet) -> tuple[DataSet, DataSet]:
         df = data.to_pandas()
-        missing = [c for c in self._feature_columns if c not in df.columns]
+        all_periods = (
+            df["time_period"]
+            .dropna()
+            .astype(str)
+            .sort_values()
+            .unique()
+        )
+
+        if len(all_periods) <= self._inner_val_periods:
+            split_idx = len(all_periods) // 2
+        else:
+            split_idx = len(all_periods) - self._inner_val_periods
+
+        train_periods = set(all_periods[:split_idx])
+        val_periods = set(all_periods[split_idx:])
+
+        df_train = df[df["time_period"].astype(str).isin(train_periods)].copy()
+        df_val = df[df["time_period"].astype(str).isin(val_periods)].copy()
+
+        inner_train = DataSet.from_pandas(df_train, FullData, fill_missing=True)
+        val_data = DataSet.from_pandas(df_val, FullData, fill_missing=True)
+        return inner_train, val_data
+
+    def _compute_weights_from_meta(self, X_meta: np.ndarray, y_val: np.ndarray) -> None:
+        if not hasattr(self._meta_model, "coef_"):
+            self._weights_ = None
+            return
+
+        coef = np.asarray(self._meta_model.coef_, dtype=float)
+        if coef.ndim == 2:
+            coef = coef[0]
+
+        weights = np.abs(coef)
+        tol = 1e-6
+        weights[weights < tol] = 0.0
+        if np.all(weights == 0):
+            weights = np.ones_like(weights)
+
+        weights = weights / (weights.sum() + 1e-12)
+        self._weights_ = weights * 100.0
+        print(f"Vekter lært fra metamodell (i prosent): {self._weights_}")
+
+    def train(self, train_data: DataSet, extra_args: Any = None) -> "EnsemblePredictor":
+        """
+        Trener ensemblet på ett CHAP-train-vindu (per backtest-split).
+        """
+        # 1) Split train_data i inner_train og val
+        inner_train, val_data = self._split_inner_train_val(train_data)
+
+        # 2) Bygg basemodeller og tren dem på inner_train
+        base_estimators: list[ConfiguredModel] = []
+        for spec in self._base_specs:
+            if spec.config is None or isinstance(spec.config, dict):
+                estimator_cls = spec.template.get_model(None)  # type: ignore[arg-type]
+            else:
+                estimator_cls = spec.template.get_model(spec.config)  # type: ignore[arg-type]
+
+            estimator = estimator_cls()  # type: ignore[call-arg]
+            base_estimators.append(estimator)
+
+        inner_predictors = [est.train(inner_train) for est in base_estimators]
+
+        # 3) Bygg nivå-2 treningsdata (X_meta, y_val)
+        df_val = val_data.to_pandas()
+        y_val = df_val[self._target_column].to_numpy()
+        key_cols = ["location", "time_period"]
+
+        meta_features = []
+        for predictor in inner_predictors:
+            preds_ds = predictor.predict(inner_train, val_data)
+            df_pred = self._samples_to_flat_dataframe(preds_ds)
+
+            merged = df_val[key_cols].merge(
+                df_pred[key_cols + ["forecast"]],
+                on=key_cols,
+                how="left",
+            )
+            meta_features.append(merged["forecast"].to_numpy())
+
+        X_meta = np.column_stack(meta_features)
+
+        # 3b) Fjern rader der målvariabelen mangler (NaN) i val-delen
+        mask = ~np.isnan(y_val)
+        if not np.any(mask):
+            raise ValueError(
+                "Ingen gyldige (ikke-NaN) målverdier i valideringsdelen for stacking."
+            )
+
+        y_val_clean = y_val[mask]
+        X_meta_clean = X_meta[mask, :]
+
+        # 4) Tren meta-modellen og hent vekter
+        self._meta_model.fit(X_meta_clean, y_val_clean)
+        self._compute_weights_from_meta(X_meta_clean, y_val_clean)
+
+        # 5) Tren basemodeller på full train_data for slutt-prediktor
+        full_predictors = []
+        for estimator in base_estimators:
+            full_predictor = estimator.train(train_data)
+            full_predictors.append(full_predictor)
+
+        return EnsemblePredictor(
+            target_column=self._target_column,
+            base_predictors=full_predictors,
+            meta_model=self._meta_model,
+        )
+
+    @staticmethod
+    def _samples_to_flat_dataframe(preds_ds: Samples) -> pd.DataFrame:
+        """
+        Konverter Samples til ett forecast-tall per (location, time_period).
+
+        Støtter flere formater fra ulike modeller:
+
+        - Kolonne 'forecast' (standard CHAP).
+        - Kolonne 'value' (noen modeller).
+        - Flere kolonner 'sample_0', 'sample_1', ... (f.eks. chap_auto_ewars).
+        - 'horizon_distance' kan mangle; da antar vi én horisont (0).
+        """
+
+        df = preds_ds.to_pandas()
+
+        # 1) Finn/konstruer prediksjonskolonne
+        pred_col: str
+
+        if "forecast" in df.columns:
+            pred_col = "forecast"
+        elif "value" in df.columns:
+            pred_col = "value"
+        else:
+            # Sjekk om vi har sample_*-kolonner (wide-format samples)
+            sample_cols = [c for c in df.columns if c.startswith("sample_")]
+            if sample_cols:
+                # Ta gjennomsnitt over samples per rad
+                df["forecast"] = df[sample_cols].mean(axis=1)
+                pred_col = "forecast"
+            else:
+                raise ValueError(
+                    "_samples_to_flat_dataframe: fant verken 'forecast', 'value' "
+                    f"eller 'sample_*' i Samples.to_pandas() kolonner: {list(df.columns)}"
+                )
+
+        # 2) Håndter horizon_distance robust
+        if "horizon_distance" in df.columns:
+            df0 = df[df["horizon_distance"] == 0].copy()
+        else:
+            df0 = df.copy()
+
+        # 3) Sørg for location og time_period
+        missing = [c for c in ["location", "time_period"] if c not in df0.columns]
         if missing:
             raise ValueError(
-                f"EnsemblePredictor: mangler kolonner i future-data: {missing}"
+                f"_samples_to_flat_dataframe: mangler kolonner {missing} i Samples.to_pandas(). "
+                f"Kolonner: {list(df0.columns)}"
             )
-        return df[self._feature_columns].copy()
 
-    def predict(self, historic_data: DataSet, future_data: DataSet) -> DataSet[Samples]:
+        # 4) Returner standardisert DataFrame
+        out = df0[["location", "time_period", pred_col]].copy()
+        out = out.rename(columns={pred_col: "forecast"})
+        return out
+
+    @property
+    def weights(self) -> np.ndarray | None:
+        return self._weights_
+
+    def predict(self, data: DataSet) -> Samples:
+        raise NotImplementedError(
+            "EnsembleEstimator brukes kun via train() som returnerer EnsemblePredictor."
+        )
+
+
+class EnsemblePredictor:
+    """
+    Bruker trenede basemodeller + meta-modell til å produsere ensemble-prediksjoner.
+    """
+
+    def __init__(
+        self,
+        target_column: str,
+        base_predictors: Sequence[Any],
+        meta_model: Any,
+    ) -> None:
+        self._target_column = target_column
+        self._base_predictors = list(base_predictors)
+        self._meta_model = meta_model
+
+    def predict(
+            self,
+            historic_data: DataSet,
+            future_data: DataSet,
+    ) -> DataSet[Samples]:
         """
-        CHAP-konsistent predict:
-        tar historic_data, future_data, og returnerer DataSet[Samples]
-        for fremtidige perioder.
-
-        Viktig: vi bruker time_period direkte fra future_data (CHAP PeriodRange),
-        og bruker kun pandas til å koble prediksjoner til riktig lokasjon.
+        CHAP-konsistent predict: returnerer DataSet[Samples],
+        én Samples-tidsserie per location.
         """
-        # 1) Bruk bare future_data til features (tabulært)
-        X_future = self._dataset_to_X(future_data)
+        df_future = future_data.to_pandas()
+        key_cols = ["location", "time_period"]
 
-        # 2) Hent lokasjonsinfo fra future_data som DataFrame
-        df_fut = future_data.to_pandas()
-        locs = df_fut["location"].to_list()
+        # 1) Samle basemodellprediksjoner for alle rader i future_data
+        meta_features = []
+        for predictor in self._base_predictors:
+            preds_ds = predictor.predict(historic_data, future_data)
+            df_pred = EnsembleEstimator._samples_to_flat_dataframe(preds_ds)
 
-        # 3) Kjør ensemblet: én prediksjonsverdi per rad
-        y_pred = self._stacked.predict(X_future)
-        assert len(y_pred) == len(df_fut)
+            merged = df_future[key_cols].merge(
+                df_pred[key_cols + ["forecast"]],
+                on=key_cols,
+                how="left",
+            )
+            meta_features.append(merged["forecast"].to_numpy())
 
-        # 4) Bygg Samples per lokasjon – tidsaksen tas direkte fra future_data[loc]
-        result_mapping: dict[Any, Samples] = {}
-        for loc in sorted(set(locs)):
-            mask = df_fut["location"] == loc
-            preds_loc = y_pred[mask]
+        X_meta_future = np.column_stack(meta_features)
 
-            # hent CHAP-perioden for denne lokasjonen fra future_data
-            try:
-                future_sample = future_data[loc]      # FullData for denne lokasjonen
-                tp = future_sample.time_period       # PeriodRange (CHAP-type)
-            except Exception as e:
-                raise RuntimeError(
-                    f"EnsemblePredictor: kunne ikke hente time_period for location {loc!r}"
-                ) from e
+        # 2) Meta-ensemble-forecast for hver rad
+        y_pred = self._meta_model.predict(X_meta_future)
 
-            # sanity check: lengde på tidsakse = lengde på prediksjoner
+        # 3) Bygg Samples per location
+        df_out = df_future.copy()
+        df_out["forecast"] = y_pred
+
+        result: dict[Any, Samples] = {}
+
+        # sørg for stabil rekkefølge: sortér på location, time_period
+        df_out = df_out.sort_values(["location", "time_period"])
+
+        for loc in sorted(df_out["location"].unique()):
+            mask = df_out["location"] == loc
+            df_loc = df_out[mask].copy()
+
+            # hent CHAP-time_period direkte fra future_data[loc]
+            future_sample = future_data[loc]  # FullData for denne lokasjonen
+            tp = future_sample.time_period
+
+            preds_loc = df_loc["forecast"].to_numpy()
             if len(preds_loc) != len(tp):
                 raise ValueError(
                     f"EnsemblePredictor: lengde på prediksjoner ({len(preds_loc)}) "
                     f"stemmer ikke med lengde på time_period ({len(tp)}) for location {loc!r}"
                 )
 
-            # Viktig: første dimensjon = prediction_length, andre = n_samples
             samples_arr = np.asarray(preds_loc, dtype=float).reshape(-1, 1)
+            samples = Samples(samples=samples_arr, time_period=tp)
+            result[loc] = samples
 
-            samples = Samples(
-                samples=samples_arr,
-                time_period=tp,
-            )
-            result_mapping[loc] = samples
+        return DataSet(result)
 
-        return DataSet(result_mapping)
-
-
-class EnsembleEstimator(ConfiguredModel):
-    """
-    En CHAP-kompatibel estimator som trener et stacked ensemble
-    av flere CHAP-modeller, og returnerer en EnsemblePredictor.
-    """
-
-    def __init__(
-        self,
-        base_model_templates: list[ModelTemplate],
-        meta_model: Any,
-        n_folds: int = 5,
-        use_time_series_split: bool = True,
-        random_state: int = 42,
-        feature_columns: list[str] | None = None,
-        target_column: str = "disease_cases",
-    ) -> None:
-        self._base_specs: list[BaseModelSpec] = [
-            BaseModelSpec(template=tpl, config=None) for tpl in base_model_templates
-        ]
-        self._meta_model = meta_model
-        self._n_folds = n_folds
-        self._use_tss = use_time_series_split
-        self._random_state = random_state
-        self._feature_columns = feature_columns
-        self._target_column = target_column
-
-        self._stacked: StackedEnsemble | None = None
-        self._base_predictors: list[ConfiguredModel] | None = None
-
-    @property
-    def weights(self) -> np.ndarray | None:
-        """
-        Returnerer vektene (i prosent) lært av meta-modellen,
-        én vekt per basemodell. None hvis modellen ikke er trent.
-        """
-        if self._stacked is None:
-            return None
-        return self._stacked.get_weights()
-
-    def _dataset_to_Xy(self, data: DataSet) -> tuple[pd.DataFrame, pd.Series]:
-        """
-        Velg features og target fra DataSet.
-        Første versjon: target = 'disease_cases', features = alle andre kolonner.
-        """
-        df = data.to_pandas()
-
-        if self._target_column not in df.columns:
-            raise ValueError(
-                f"EnsembleEstimator: '{self._target_column}' finnes ikke i datasettet."
-            )
-
-        y = df[self._target_column].copy()
-
-        if self._feature_columns is None:
-            self._feature_columns = [c for c in df.columns if c != self._target_column]
-
-        X = df[self._feature_columns].copy()
-        return X, y
-
-    def train(self, train_data: DataSet, extra_args=None) -> EnsemblePredictor:
-        """
-        Trener stacked-ensemblet.
-        """
-        X, y = self._dataset_to_Xy(train_data)
-
-        # Fjern rader der target er NaN (meta-modellen tåler ikke NaN i y)
-        if isinstance(y, pd.Series):
-            mask = ~y.isna()
-        else:
-            mask = ~np.isnan(y)
-        X = X[mask]
-        y = y[mask]
-
-        # 2) Lag basemodeller (ConfiguredModel)
-        base_estimators: list[ConfiguredModel] = []
-        for spec in self._base_specs:
-            estimator_cls = spec.template.get_model(spec.config)
-            estimator = estimator_cls()  # type: ignore[call-arg]
-            base_estimators.append(estimator)
-
-        # 3) Wrap basemodeller til noe StackedEnsemble kan bruke
-        base_wrappers = [
-            _ConfiguredModelWrapper(estimator, self._feature_columns, self._target_column)
-            for estimator in base_estimators
-        ]
-
-        # 4) Tren StackedEnsemble på tabulær X, y
-        stacked = StackedEnsemble(
-            base_models=base_wrappers,
-            meta_model=self._meta_model,
-            n_folds=self._n_folds,
-            use_time_series_split=self._use_tss,
-            random_state=self._random_state,
-        )
-        stacked.train(X, y)
-
-        # 5) Tren hver basemodell på hele train_data for senere bruk (CHAP-prediksjoner)
-        base_predictors: list[ConfiguredModel] = []
-        for estimator in base_estimators:
-            predictor = estimator.train(train_data)
-            base_predictors.append(predictor)
-
-        self._stacked = stacked
-        self._base_predictors = base_predictors
-
-        return EnsemblePredictor(
-            stacked=stacked,
-            base_predictors=base_predictors,
-            feature_columns=self._feature_columns,
-            target_column=self._target_column,
-        )
-
-    def predict(self, historic_data: DataSet, future_data: DataSet) -> DataSet[Samples]:
-        """
-        Implementasjon kreves av ConfiguredModel, men all reell prediksjon
-        gjøres av EnsemblePredictor. Denne metoden delegere dit.
-        """
-        if self._stacked is None or self._base_predictors is None:
-            raise RuntimeError(
-                "EnsembleEstimator: modellen er ikke trent. "
-                "Kall .train() først for å få en EnsemblePredictor."
-            )
-
-        predictor = EnsemblePredictor(
-            stacked=self._stacked,
-            base_predictors=self._base_predictors,
-            feature_columns=self._feature_columns,
-            target_column=self._target_column,
-        )
-        return predictor.predict(historic_data, future_data)
-
-
-class _ConfiguredModelWrapper:
-    """
-    Intern wrapper som gir et ConfiguredModel-etimator samme interface som
-    base-modellene dine i StackedEnsemble: .fit(X_df, y) og .predict(X_df).
-
-    VIKTIG: predict(X) må returnere én verdi per rad i X.
-    """
-
-    def __init__(
-        self,
-        estimator: ConfiguredModel,
-        feature_columns: list[str],
-        target_column: str = "disease_cases",
-    ) -> None:
-        self._estimator = estimator
-        self._feature_columns = feature_columns
-        self._target_column = target_column
-        self._predictor: ConfiguredModel | None = None
-
-    def _XY_to_dataset(
-            self, X: pd.DataFrame, y: pd.Series | np.ndarray | None
-    ) -> DataSet:
-        """
-        Bygg et DataSet fra X (+ ev. y).
-        Vi antar at X har minst time_period, location og klimavariabler.
-        """
-        df = X.copy()
-        import numpy as _np
-
-        if y is not None:
-            y_arr = _np.asarray(y)
-            df[self._target_column] = y_arr
-        else:
-            if self._target_column not in df.columns:
-                df[self._target_column] = _np.nan
-
-        # Viktig: tillat hull i tidsserien når vi lager DataSet fra et fold-subsett
-        return DataSet.from_pandas(df, FullData, fill_missing=True)
-
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
-        dataset = self._XY_to_dataset(X, y)
-        self._predictor = self._estimator.train(dataset)
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """
-        Returner én prediksjon per rad i X.
-
-        Vi:
-        - bygger et DataSet av X,
-        - lar CHAP-modellen predikere per location,
-        - tar én skalar per location (gjennomsnitt over samples og tider),
-        - og mapper denne tilbake til hver rad i X etter location.
-        """
-        if self._predictor is None:
-            raise RuntimeError("_ConfiguredModelWrapper: modellen er ikke trent.")
-
-        # 1) bygg DataSet fra akkurat dette (fold-subsettet)
-        dataset = self._XY_to_dataset(X, y=None)
-
-        # 2) få CHAP-prediksjoner per location
-        preds_ds = self._predictor.predict(dataset, dataset)
-
-        # 3) én skalar per location fra CHAP-prediksjonene
-        loc_to_value: dict[Any, float] = {}
-        for loc, samples in preds_ds.items():
-            arr = samples.samples  # (n_samples, prediction_length)
-            loc_to_value[loc] = float(np.mean(arr))
-
-        # 4) bygg verdier i samme lengde og rekkefølge som X
-        df = X
-        if "location" not in df.columns:
-            raise ValueError(
-                "_ConfiguredModelWrapper.predict: 'location' mangler i X"
-            )
-
-        vals: list[float] = []
-        for loc in df["location"]:
-            if loc not in loc_to_value:
-                raise KeyError(
-                    f"_ConfiguredModelWrapper.predict: location {loc!r} mangler i preds_ds"
-                )
-            vals.append(loc_to_value[loc])
-
-        return np.array(vals, dtype=float)
