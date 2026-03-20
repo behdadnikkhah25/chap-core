@@ -91,6 +91,15 @@ def evaluate_ensemble(
             help="Basisnavn for rapport (uten .csv – det lages .csv og .i.csv filer)."
         ),
     ] = Path("ensemble_report.csv"),
+    output_file: Annotated[
+        Path | None,
+        Parameter(
+            help=(
+                "Path for output NetCDF file containing ensemble evaluation results "
+                "(.nc extension). Hvis ikke satt, brukes report_filename med .nc-suffiks."
+            )
+        ),
+    ] = None,
     backtest_params: Annotated[
         BackTestParams,
         Parameter(
@@ -247,9 +256,13 @@ def evaluate_ensemble(
     )
 
     # 6b) Lagre hele Evaluation til NetCDF for plotting / videre analyse
-    eval_nc = report_filename.with_suffix(".nc")
-    evaluation.to_file(str(eval_nc))
+    if output_file is None:
+        eval_nc = report_filename.with_suffix(".nc")
+    else:
+        eval_nc = output_file
+
     logger.info(f"Saved ensemble evaluation NetCDF to {eval_nc}")
+    evaluation.to_file(str(eval_nc))
 
     # 6c) Logg vekter fra meta-modellen, hvis tilgjengelig
     weights = ensemble_estimator.weights

@@ -65,6 +65,21 @@ class EnsembleEstimator(ConfiguredModel):
         self._weights_: np.ndarray | None = None
         self._feature_columns: list[str] | None = None
 
+        # NYTT: lagre lesbare navn på basemodellene (bruk template.name eller repo-slug)
+        base_names: list[str] = []
+        for spec in self._base_specs:
+            tmpl = spec.template
+            name = getattr(tmpl, "name", None)
+            if not name:
+                # fallback: hent siste del av repo-URLen hvis mulig
+                repo = getattr(tmpl, "repo", None)
+                if isinstance(repo, str) and repo:
+                    name = repo.rstrip("/").split("/")[-1]
+                else:
+                    name = str(tmpl)
+            base_names.append(name)
+        self._base_model_names = base_names
+
     @classmethod
     def from_config(cls, spec: Any) -> "EnsembleEstimator":
         base_specs: list[BaseModelSpec] = []
@@ -110,6 +125,15 @@ class EnsembleEstimator(ConfiguredModel):
         return inner_train, val_data
 
     def _compute_weights_from_meta(self, X_meta: np.ndarray, y_val: np.ndarray) -> None:
+        """
+        Henter koeffisienter fra meta-modellen, normaliserer til prosentvekter
+        og lagrer dem sammen med basemodell-navnene.
+
+        I tillegg:
+        - Skriver lesbar tekst til terminal
+        - Skriver en CSV-fil 'ensemble_meta_weights.0.csv' med kolonnene:
+          meta_model, base_model, weight_percent
+        """
         if not hasattr(self._meta_model, "coef_"):
             self._weights_ = None
             return
@@ -118,6 +142,7 @@ class EnsembleEstimator(ConfiguredModel):
         if coef.ndim == 2:
             coef = coef[0]
 
+        # Absoluttverdier + terskel, slik du hadde
         weights = np.abs(coef)
         tol = 1e-6
         weights[weights < tol] = 0.0
@@ -125,8 +150,48 @@ class EnsembleEstimator(ConfiguredModel):
             weights = np.ones_like(weights)
 
         weights = weights / (weights.sum() + 1e-12)
-        self._weights_ = weights * 100.0
+        weights_percent = weights * 100.0
+        self._weights_ = weights_percent
+
+        # Koble vekter til modellnavn
+        try:
+            name_weight_pairs = list(zip(self._base_model_names, weights_percent))
+        except AttributeError:
+            # Fallback hvis _base_model_names ikke finnes
+            name_weight_pairs = [(f"model_{i}", w) for i, w in enumerate(weights_percent)]
+
+        # 1) Lesbar print til terminal
         print(f"Vekter lært fra metamodell (i prosent): {self._weights_}")
+        print(
+            "Meta-vekter per modell: "
+            + "; ".join(f"{name}: {w:.2f}%" for name, w in name_weight_pairs)
+        )
+
+        # 2) Skriv en "rapport"-CSV i stil med ensemble_report.csv:
+        #    Første kolonne: Model
+        #    Videre kolonner: én per basemodell, med vekt i prosent.
+        #    Eksempel:
+        #    Model,rwanda_sarimax,chap_ewars_monthly,rwanda_random_forest,INLA_baseline
+        #    ensemble_meta,14.72,63.52,2.74,19.02
+        try:
+            import csv
+            from pathlib import Path
+
+            report_path = Path("ensemble_meta_report.csv")
+
+            # Header: Model + ett felt per basemodell
+            header = ["Model"] + [name for name, _ in name_weight_pairs]
+            # Rad: "ensemble_meta" + vektverdiene i samme rekkefølge
+            row = ["ensemble_meta"] + [f"{float(w):.6f}" for _, w in name_weight_pairs]
+
+            with report_path.open("w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerow(row)
+
+            print(f"Lagret ensemble-meta-rapport til {report_path.resolve()}")
+        except Exception as e:
+            print(f"Advarsel: klarte ikke å skrive ensemble_meta_report.csv: {e}")
 
     def train(self, train_data: DataSet, extra_args: Any = None) -> "EnsemblePredictor":
         """
@@ -331,4 +396,3 @@ class EnsemblePredictor:
             result[loc] = samples
 
         return DataSet(result)
-
