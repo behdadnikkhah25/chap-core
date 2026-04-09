@@ -42,6 +42,9 @@ class NonNegativeMetaModel:
         """
         # NNLS løser: min ||Ax - b||^2 subject to x >= 0
         coef, _ = nnls(X, y)
+        s = coef.sum()
+        if s > 0:
+            coef = coef / s  # Normaliserer til vekter som summerer til 1
         self.coef_ = coef
         # Intercept blir 0 siden vi jobber direkte med prediksjoner
         self.intercept_ = 0.0
@@ -186,12 +189,15 @@ class EnsembleEstimator(ConfiguredModel):
 
         # NNLS sikrer non-negative koeffisienter, men sikrer med absoluttverdier
         # Hvis noen koeff er negative pga numerisk instabilitet, ta absolutt verdi
-        coef = np.abs(coef)
+        #coef = np.abs(coef)
 
         # Normaliserer koeffisienter direkte til vekter
         # Normaliserer slik at de summerer til 100% (prosenter)
-        coef_sum = coef.sum() + 1e-12
-        weights_percent = (coef / coef_sum) * 100.0
+
+        #coef_sum = coef.sum() + 1e-12
+
+        #weights_percent = (coef / coef_sum) * 100.0
+        weights_percent = coef * 100.0  # Direkte prosentvekter uten ytterligere normalisering
         self._weights_ = weights_percent
 
         # Koble vekter til modellnavn

@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Annotated
 
 from cyclopts import Parameter
-from sklearn.linear_model import LinearRegression
 
 from chap_core.api_types import BackTestParams, RunConfig
 from chap_core.assessment.evaluation import Evaluation
@@ -25,7 +24,7 @@ from chap_core.database.model_templates_and_config_tables import (
     ModelConfiguration,
     ModelTemplateDB,
 )
-from chap_core.ensemble.ensemble_model import EnsembleEstimator
+from chap_core.ensemble.ensemble_model import EnsembleEstimator, NonNegativeMetaModel
 from chap_core.log_config import initialize_logging
 from chap_core.models.model_template import ModelTemplate
 from chap_core.models.utils import CHAP_RUNS_DIR
@@ -219,7 +218,7 @@ def evaluate_ensemble(
         templates.append(tpl)
 
     # 5) Bygg EnsembleEstimator
-    meta_model = LinearRegression()
+    meta_model = NonNegativeMetaModel()
     ensemble_estimator = EnsembleEstimator(
         base_model_templates=templates,
         meta_model=meta_model,
