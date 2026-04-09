@@ -223,8 +223,7 @@ def evaluate_ensemble(
     ensemble_estimator = EnsembleEstimator(
         base_model_templates=templates,
         meta_model=meta_model,
-        n_folds=backtest_params.n_splits,
-        use_time_series_split=True,
+        inner_val_periods=12,
     )
 
     # 6) Lag "syntetiske" DB‑objekter for Evaluation

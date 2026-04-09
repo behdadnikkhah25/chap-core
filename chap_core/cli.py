@@ -10,8 +10,7 @@ warnings.filterwarnings("ignore", module="bionumpy")
 
 from cyclopts import App
 
-from chap_core.cli_endpoints import convert, evaluate, forecast, preference_learn, utils, validate
-from chap_core.cli_endpoints import ensemble
+from chap_core.cli_endpoints import convert, ensemble, evaluate, forecast, preference_learn, utils, validate
 
 logging.basicConfig(
     level=logging.INFO,

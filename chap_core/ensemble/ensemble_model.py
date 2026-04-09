@@ -1,18 +1,61 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import pandas as pd
-from sklearn.linear_model import LinearRegression
+from scipy.optimize import nnls
 
-from chap_core.datatypes import Samples, FullData
+from chap_core.datatypes import FullData, Samples
 from chap_core.models.configured_model import ConfiguredModel
-from chap_core.models.model_template import ModelTemplate
 from chap_core.spatio_temporal_data.temporal_dataclass import DataSet
 
-from chap_core.ensemble.classes.stackedEnsemble import StackedEnsemble  # ikke brukt, men beholdes for kompatibilitet
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    import pandas as pd
+
+    from chap_core.models.model_template import ModelTemplate
+
+
+class NonNegativeMetaModel:
+    """
+    Meta-modell for ensemble som bruker non-negative least squares (NNLS).
+    
+    Dette sikrer at:
+    1. Alle vekter er non-negative (>= 0)
+    2. Ingen negative prediksjoner for count-data
+    3. Vekter reflekterer faktisk viktighet av hver base-modell
+    """
+
+    def __init__(self) -> None:
+        self.coef_ = None
+        self.intercept_ = 0.0
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> NonNegativeMetaModel:
+        """
+        Finner non-negative koeffisienter som minimerer ||Xw - y||^2
+        hvor w >= 0 for alle elementer.
+        
+        X shape: (n_samples, n_features) - base modell prediksjoner
+        y shape: (n_samples,) - target verdier
+        """
+        # NNLS løser: min ||Ax - b||^2 subject to x >= 0
+        coef, _ = nnls(X, y)
+        self.coef_ = coef
+        # Intercept blir 0 siden vi jobber direkte med prediksjoner
+        self.intercept_ = 0.0
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        Predikterer som vektet kombinasjon av base modeller.
+        """
+        if self.coef_ is None:
+            raise ValueError("Modellen må fittas først")
+
+        # Vektet kombinasjon: sum(coef_i * X_i)
+        return np.dot(X, self.coef_)
 
 
 @dataclass
@@ -40,8 +83,6 @@ class EnsembleEstimator(ConfiguredModel):
         target_column: str = "disease_cases",
         inner_val_periods: int = 12,
         meta_model: Any | None = None,
-        n_folds: int | None = None,
-        use_time_series_split: bool | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -52,8 +93,10 @@ class EnsembleEstimator(ConfiguredModel):
             specs.extend(list(base_model_specs))
 
         if base_model_templates is not None:
-            for tmpl in base_model_templates:
-                specs.append(BaseModelSpec(template=tmpl, config=None))
+            specs.extend(
+                BaseModelSpec(template=tmpl, config=None)
+                for tmpl in base_model_templates
+            )
 
         if not specs:
             raise ValueError("EnsembleEstimator krever minst én base-modell.")
@@ -61,7 +104,7 @@ class EnsembleEstimator(ConfiguredModel):
         self._base_specs = specs
         self._target_column = target_column
         self._inner_val_periods = inner_val_periods
-        self._meta_model = meta_model or LinearRegression()
+        self._meta_model = meta_model or NonNegativeMetaModel()
         self._weights_: np.ndarray | None = None
         self._feature_columns: list[str] | None = None
 
@@ -81,7 +124,7 @@ class EnsembleEstimator(ConfiguredModel):
         self._base_model_names = base_names
 
     @classmethod
-    def from_config(cls, spec: Any) -> "EnsembleEstimator":
+    def from_config(cls, spec: Any) -> EnsembleEstimator:
         base_specs: list[BaseModelSpec] = []
         for bm in spec.config["base_models"]:
             cfg = bm.get("config", None)
@@ -131,8 +174,7 @@ class EnsembleEstimator(ConfiguredModel):
 
         I tillegg:
         - Skriver lesbar tekst til terminal
-        - Skriver en CSV-fil 'ensemble_meta_weights.0.csv' med kolonnene:
-          meta_model, base_model, weight_percent
+        - Skriver en CSV-fil 'ensemble_meta_report.csv' med vektingen
         """
         if not hasattr(self._meta_model, "coef_"):
             self._weights_ = None
@@ -142,20 +184,19 @@ class EnsembleEstimator(ConfiguredModel):
         if coef.ndim == 2:
             coef = coef[0]
 
-        # Absoluttverdier + terskel, slik du hadde
-        weights = np.abs(coef)
-        tol = 1e-6
-        weights[weights < tol] = 0.0
-        if np.all(weights == 0):
-            weights = np.ones_like(weights)
+        # NNLS sikrer non-negative koeffisienter, men sikrer med absoluttverdier
+        # Hvis noen koeff er negative pga numerisk instabilitet, ta absolutt verdi
+        coef = np.abs(coef)
 
-        weights = weights / (weights.sum() + 1e-12)
-        weights_percent = weights * 100.0
+        # Normaliserer koeffisienter direkte til vekter
+        # Normaliserer slik at de summerer til 100% (prosenter)
+        coef_sum = coef.sum() + 1e-12
+        weights_percent = (coef / coef_sum) * 100.0
         self._weights_ = weights_percent
 
         # Koble vekter til modellnavn
         try:
-            name_weight_pairs = list(zip(self._base_model_names, weights_percent))
+            name_weight_pairs = list(zip(self._base_model_names, weights_percent, strict=True))
         except AttributeError:
             # Fallback hvis _base_model_names ikke finnes
             name_weight_pairs = [(f"model_{i}", w) for i, w in enumerate(weights_percent)]
@@ -168,11 +209,6 @@ class EnsembleEstimator(ConfiguredModel):
         )
 
         # 2) Skriv en "rapport"-CSV i stil med ensemble_report.csv:
-        #    Første kolonne: Model
-        #    Videre kolonner: én per basemodell, med vekt i prosent.
-        #    Eksempel:
-        #    Model,rwanda_sarimax,chap_ewars_monthly,rwanda_random_forest,INLA_baseline
-        #    ensemble_meta,14.72,63.52,2.74,19.02
         try:
             import csv
             from pathlib import Path
@@ -193,7 +229,7 @@ class EnsembleEstimator(ConfiguredModel):
         except Exception as e:
             print(f"Advarsel: klarte ikke å skrive ensemble_meta_report.csv: {e}")
 
-    def train(self, train_data: DataSet, extra_args: Any = None) -> "EnsemblePredictor":
+    def train(self, train_data: DataSet, extra_args: Any = None) -> EnsemblePredictor:
         """
         Trener ensemblet på ett CHAP-train-vindu (per backtest-split).
         """
@@ -224,7 +260,7 @@ class EnsembleEstimator(ConfiguredModel):
             df_pred = self._samples_to_flat_dataframe(preds_ds)
 
             merged = df_val[key_cols].merge(
-                df_pred[key_cols + ["forecast"]],
+                df_pred[[*key_cols, "forecast"]],
                 on=key_cols,
                 how="left",
             )
@@ -241,6 +277,27 @@ class EnsembleEstimator(ConfiguredModel):
 
         y_val_clean = y_val[mask]
         X_meta_clean = X_meta[mask, :]
+
+        # 3c) Sjekk for NaN i meta-features fra basemodellene
+        nan_in_X = np.any(np.isnan(X_meta_clean), axis=1)
+        if np.any(nan_in_X):
+            import logging
+            logger = logging.getLogger(__name__)
+            n_nan_rows = np.sum(nan_in_X)
+            pct_nan = 100 * n_nan_rows / len(nan_in_X)
+            logger.warning(
+                f"Fjerner {n_nan_rows} rader ({pct_nan:.1f}%) med NaN i meta-features "
+                f"fra basemodellprediksjoner"
+            )
+            valid_mask = ~nan_in_X
+            X_meta_clean = X_meta_clean[valid_mask]
+            y_val_clean = y_val_clean[valid_mask]
+
+        if len(y_val_clean) == 0:
+            raise ValueError(
+                "Ingen gyldige rader igjen etter fjerning av NaN/manglende verdier. "
+                "Sjekk at basemodellene produserer gyldige prediksjoner."
+            )
 
         # 4) Tren meta-modellen og hent vekter
         self._meta_model.fit(X_meta_clean, y_val_clean)
@@ -356,7 +413,7 @@ class EnsemblePredictor:
             df_pred = EnsembleEstimator._samples_to_flat_dataframe(preds_ds)
 
             merged = df_future[key_cols].merge(
-                df_pred[key_cols + ["forecast"]],
+                df_pred[[*key_cols, "forecast"]],
                 on=key_cols,
                 how="left",
             )
