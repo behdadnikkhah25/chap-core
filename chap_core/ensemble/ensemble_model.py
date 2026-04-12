@@ -29,8 +29,8 @@ class NonNegativeMetaModel:
     """
 
     def __init__(self) -> None:
-        self.coef_ = None
-        self.intercept_ = 0.0
+        self.coef_: np.ndarray | None = None
+        self.intercept_: float = 0.0
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> NonNegativeMetaModel:
         """
@@ -77,6 +77,11 @@ class BaseModelSpec:
 class EnsembleEstimator(ConfiguredModel):
     """
     Ensemble-estimator som bruker holdout-stacking på tidsseriehale.
+    
+    Støtter både deterministisk og probabilistisk output:
+    - Deterministisk: punkt-prediksjoner kombinert med vekter
+    - Probabilistisk: samples generert rundt punkt-prediksjoner 
+      basert på observerte residualer fra validering
     """
 
     def __init__(
@@ -86,6 +91,8 @@ class EnsembleEstimator(ConfiguredModel):
         target_column: str = "disease_cases",
         inner_val_periods: int = 12,
         meta_model: Any | None = None,
+        probabilistic: bool = False,
+        n_samples: int = 100,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -110,14 +117,18 @@ class EnsembleEstimator(ConfiguredModel):
         self._meta_model = meta_model or NonNegativeMetaModel()
         self._weights_: np.ndarray | None = None
         self._feature_columns: list[str] | None = None
+        self._probabilistic = probabilistic
+        self._n_samples = n_samples
+        
+        # For probabilistisk ensemble: lagre residualer fra basemodeller
+        self._base_residuals: list[np.ndarray] = []
 
-        # NYTT: lagre lesbare navn på basemodellene (bruk template.name eller repo-slug)
+        # Lagre lesbare navn på basemodellene
         base_names: list[str] = []
         for spec in self._base_specs:
             tmpl = spec.template
             name = getattr(tmpl, "name", None)
             if not name:
-                # fallback: hent siste del av repo-URLen hvis mulig
                 repo = getattr(tmpl, "repo", None)
                 if isinstance(repo, str) and repo:
                     name = repo.rstrip("/").split("/")[-1]
@@ -261,6 +272,8 @@ class EnsembleEstimator(ConfiguredModel):
         key_cols = ["location", "time_period"]
 
         meta_features = []
+        base_residuals_list: list[np.ndarray] = []
+        
         for predictor in inner_predictors:
             preds_ds = predictor.predict(inner_train, val_data)
             df_pred = self._samples_to_flat_dataframe(preds_ds)
@@ -270,7 +283,12 @@ class EnsembleEstimator(ConfiguredModel):
                 on=key_cols,
                 how="left",
             )
-            meta_features.append(merged["forecast"].to_numpy())
+            base_preds = merged["forecast"].to_numpy()
+            meta_features.append(base_preds)
+            
+            # Beregn residualer for denne modellen
+            residuals = y_val - base_preds
+            base_residuals_list.append(residuals)
 
         X_meta = np.column_stack(meta_features)
 
@@ -283,6 +301,9 @@ class EnsembleEstimator(ConfiguredModel):
 
         y_val_clean = y_val[mask]
         X_meta_clean = X_meta[mask, :]
+        
+        # Filtrer residualer samme måte
+        base_residuals_clean = [res[mask] for res in base_residuals_list]
 
         # 3c) Sjekk for NaN i meta-features fra basemodellene
         nan_in_X = np.any(np.isnan(X_meta_clean), axis=1)
@@ -298,6 +319,7 @@ class EnsembleEstimator(ConfiguredModel):
             valid_mask = ~nan_in_X
             X_meta_clean = X_meta_clean[valid_mask]
             y_val_clean = y_val_clean[valid_mask]
+            base_residuals_clean = [res[valid_mask] for res in base_residuals_clean]
 
         if len(y_val_clean) == 0:
             raise ValueError(
@@ -308,8 +330,11 @@ class EnsembleEstimator(ConfiguredModel):
         # 4) Tren meta-modellen og hent vekter
         self._meta_model.fit(X_meta_clean, y_val_clean)
         self._compute_weights_from_meta(X_meta_clean, y_val_clean)
+        
+        # 5) Lagre residualer alltid (brukes av probabilistisk modus)
+        self._base_residuals = base_residuals_clean
 
-        # 5) Tren basemodeller på full train_data for slutt-prediktor
+        # 6) Tren basemodeller på full train_data for slutt-prediktor
         full_predictors = []
         for estimator in base_estimators:
             full_predictor = estimator.train(train_data)
@@ -319,6 +344,9 @@ class EnsembleEstimator(ConfiguredModel):
             target_column=self._target_column,
             base_predictors=full_predictors,
             meta_model=self._meta_model,
+            probabilistic=self._probabilistic,
+            n_samples=self._n_samples,
+            base_residuals=self._base_residuals,
         )
 
     @staticmethod
@@ -384,10 +412,14 @@ class EnsembleEstimator(ConfiguredModel):
             "EnsembleEstimator brukes kun via train() som returnerer EnsemblePredictor."
         )
 
-
 class EnsemblePredictor:
     """
     Bruker trenede basemodeller + meta-modell til å produsere ensemble-prediksjoner.
+    
+    Støtter to modi:
+    - Deterministisk: punkt-prediksjoner kombinert med vekter
+    - Probabilistisk: samples rundt punkt-prediksjoner basert på 
+                      observerte residualer fra validering
     """
 
     def __init__(
@@ -395,24 +427,33 @@ class EnsemblePredictor:
         target_column: str,
         base_predictors: Sequence[Any],
         meta_model: Any,
+        probabilistic: bool = False,
+        n_samples: int = 100,
+        base_residuals: list[np.ndarray] | None = None,
     ) -> None:
         self._target_column = target_column
         self._base_predictors = list(base_predictors)
         self._meta_model = meta_model
+        self._probabilistic = probabilistic
+        self._n_samples = n_samples
+        self._base_residuals = base_residuals or []
 
     def predict(
-            self,
-            historic_data: DataSet,
-            future_data: DataSet,
+        self,
+        historic_data: DataSet,
+        future_data: DataSet,
     ) -> DataSet[Samples]:
         """
-        CHAP-konsistent predict: returnerer DataSet[Samples],
-        én Samples-tidsserie per location.
+        CHAP-konsistent predict: returnerer DataSet[Samples].
+        
+        - Hvis probabilistic=True ELLER residualer er tilgjengelige:
+          Genererer samples basert på residual-fordeling
+        - Ellers: punkt-prediksjoner (deterministisk)
         """
         df_future = future_data.to_pandas()
         key_cols = ["location", "time_period"]
 
-        # 1) Samle basemodellprediksjoner for alle rader i future_data
+        # 1) Samle basemodellprediksjoner for alle rader
         meta_features = []
         for predictor in self._base_predictors:
             preds_ds = predictor.predict(historic_data, future_data)
@@ -427,35 +468,151 @@ class EnsemblePredictor:
 
         X_meta_future = np.column_stack(meta_features)
 
-        # 2) Meta-ensemble-forecast for hver rad
-        y_pred = self._meta_model.predict(X_meta_future)
+        # 2) Hent meta-vekter
+        if not hasattr(self._meta_model, "coef_") or self._meta_model.coef_ is None:
+            raise ValueError("Meta-modellen må være trent.")
 
-        # 3) Bygg Samples per location
+        weights = np.asarray(self._meta_model.coef_, dtype=float)
+        if weights.ndim == 2:
+            weights = weights[0]
+        
+        # Sikre positive vekter
+        weights = np.abs(weights)
+        w_sum = weights.sum()
+        if w_sum <= 0:
+            raise ValueError("Meta-vekter har sum <= 0.")
+        weights = weights / w_sum
+
+        # 3) Velg modus: probabilistisk hvis vi har residualer ELLER probabilistic=True
+        has_residuals = self._base_residuals and len(self._base_residuals) > 0
+        
+        if self._probabilistic or has_residuals:
+            return self._predict_probabilistic(
+                X_meta_future, weights, df_future, future_data
+            )
+        else:
+            # Deterministisk fallback: vektet kombinasjon av punkt-prediksjoner
+            y_pred = self._meta_model.predict(X_meta_future)
+            df_out = df_future.copy()
+            df_out["forecast"] = y_pred
+
+            result: dict[Any, Samples] = {}
+            df_out = df_out.sort_values(["location", "time_period"])
+
+            for loc in sorted(df_out["location"].unique()):
+                mask = df_out["location"] == loc
+                df_loc = df_out[mask].copy()
+
+                future_sample = future_data[loc]
+                tp = future_sample.time_period
+
+                preds_loc = df_loc["forecast"].to_numpy()
+                if len(preds_loc) != len(tp):
+                    raise ValueError(
+                        f"Lengde på prediksjoner stemmer ikke for location {loc!r}"
+                    )
+
+                samples_arr = np.asarray(preds_loc, dtype=float).reshape(-1, 1)
+                samples = Samples(samples=samples_arr, time_period=tp)
+                result[loc] = samples
+
+            return DataSet(result)
+
+    def _predict_probabilistic(
+        self,
+        X_meta_future: np.ndarray,
+        weights: np.ndarray,
+        df_future: Any,
+        future_data: DataSet,
+    ) -> DataSet[Samples]:
+        """
+        Generer probabilistiske samples rundt punkt-prediksjoner.
+        
+        For hver basemodell-prediksjon, tegn samples fra residual-fordelingen
+        observert under trening, vekt dem, og kombinér.
+        
+        VIKTIG: Denne metoden håndterer både deterministiske og probabilistiske basemodeller.
+        """
+        n_rows = X_meta_future.shape[0]
+        S = self._n_samples
+
+        # Få punkt-prediksjoner fra meta-modellen (for sentrum av samples)
+        y_pred_point = self._meta_model.predict(X_meta_future)
+
+        # Hvis ingen residualer, returner deterministisk
+        if not self._base_residuals or len(self._base_residuals) == 0:
+            df_out = df_future.copy()
+            df_out["forecast"] = y_pred_point
+            result: dict[Any, Samples] = {}
+            df_out = df_out.sort_values(["location", "time_period"])
+
+            for loc in sorted(df_out["location"].unique()):
+                mask = df_out["location"] == loc
+                df_loc = df_out[mask].copy()
+                future_sample = future_data[loc]
+                tp = future_sample.time_period
+                preds_loc = df_loc["forecast"].to_numpy()
+                samples_arr = np.asarray(preds_loc, dtype=float).reshape(-1, 1)
+                samples = Samples(samples=samples_arr, time_period=tp)
+                result[loc] = samples
+
+            return DataSet(result)
+
+        # Generer samples for hver basemodell basert på residualer
+        # Sikre minimum varians: hvis residual-std er for liten, bruk punkter
+        ensemble_samples = np.zeros((n_rows, S), dtype=float)
+
+        for model_idx in range(len(self._base_residuals)):
+            residuals = self._base_residuals[model_idx]
+            
+            # Fjern NaN residualer
+            residuals_clean = residuals[~np.isnan(residuals)]
+            
+            if len(residuals_clean) == 0:
+                # Hvis ingen residualer for denne modellen, bruk punkt-prediksjon
+                for row_idx in range(n_rows):
+                    model_base_pred = X_meta_future[row_idx, model_idx]
+                    ensemble_samples[row_idx, :] += weights[model_idx] * model_base_pred
+                continue
+
+            # Beregn empirisk standardavvik av residualer
+            residual_std = np.std(residuals_clean)
+            
+            # For hver prediksjon: tegn samples fra residual-fordelingen
+            for row_idx in range(n_rows):
+                # Tegn S samples fra observerte residualer (med replacement)
+                sampled_residuals = np.random.choice(
+                    residuals_clean, size=S, replace=True
+                )
+                # Legg til residualer til punkt-prediksjonen
+                model_base_pred = X_meta_future[row_idx, model_idx]
+                model_samples = model_base_pred + sampled_residuals
+                
+                # Sikre at prediksjoner ikke blir negative (for count-data)
+                model_samples = np.maximum(model_samples, 0.0)
+                
+                # Vekt med modell-vekt
+                ensemble_samples[row_idx, :] += weights[model_idx] * model_samples
+
+        # Pakk tilbake til DataSet[Samples]
         df_out = df_future.copy()
-        df_out["forecast"] = y_pred
-
         result: dict[Any, Samples] = {}
 
-        # sørg for stabil rekkefølge: sortér på location, time_period
-        df_out = df_out.sort_values(["location", "time_period"])
-
-        for loc in sorted(df_out["location"].unique()):
-            mask = df_out["location"] == loc
-            df_loc = df_out[mask].copy()
-
-            # hent CHAP-time_period direkte fra future_data[loc]
-            future_sample = future_data[loc]  # FullData for denne lokasjonen
+        # Bygg en rad per location/time_period med samples
+        for loc in sorted(future_data.locations()):
+            mask = df_future["location"] == loc
+            future_sample = future_data[loc]
             tp = future_sample.time_period
 
-            preds_loc = df_loc["forecast"].to_numpy()
-            if len(preds_loc) != len(tp):
+            # Hent samples for denne lokasjonen
+            loc_rows_idx = np.where(np.asarray(mask))[0]
+            if len(loc_rows_idx) != len(tp):
                 raise ValueError(
-                    f"EnsemblePredictor: lengde på prediksjoner ({len(preds_loc)}) "
-                    f"stemmer ikke med lengde på time_period ({len(tp)}) for location {loc!r}"
+                    f"Antall rader for {loc} matcher ikke time_period"
                 )
 
-            samples_arr = np.asarray(preds_loc, dtype=float).reshape(-1, 1)
-            samples = Samples(samples=samples_arr, time_period=tp)
-            result[loc] = samples
+            loc_samples = ensemble_samples[loc_rows_idx, :]
+            samples_obj = Samples(samples=loc_samples, time_period=tp)
+            result[loc] = samples_obj
 
         return DataSet(result)
