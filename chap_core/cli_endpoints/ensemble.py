@@ -1,4 +1,3 @@
-
 # chap_core/cli_endpoints/ensemble.py
 
 """Ensemble evaluation commands for CHAP CLI."""
@@ -24,7 +23,7 @@ from chap_core.database.model_templates_and_config_tables import (
     ModelConfiguration,
     ModelTemplateDB,
 )
-from chap_core.ensemble.ensemble_model import EnsembleEstimator, NonNegativeMetaModel
+from chap_core.ensemble.ensemble_model import EnsembleEstimator, NonNegativeMetaModel, ProbabilisticMetaModel
 from chap_core.log_config import initialize_logging
 from chap_core.models.model_template import ModelTemplate
 from chap_core.models.utils import CHAP_RUNS_DIR
@@ -218,11 +217,14 @@ def evaluate_ensemble(
         templates.append(tpl)
 
     # 5) Bygg EnsembleEstimator
-    meta_model = NonNegativeMetaModel()
+    # Velg meta-modell: Probabilistisk (CRPS) eller Deterministisk (NNLS)
+    meta_model = ProbabilisticMetaModel(verbose=True)  # CRPS-optimering
     ensemble_estimator = EnsembleEstimator(
         base_model_templates=templates,
+        probabilistic_meta_model=True,   # Bruk CRPS-optimering
+        probabilistic=True,              # Returner samples
         meta_model=meta_model,
-        inner_val_periods=12,
+        inner_val_periods=12,  # Optimal verdi - større splits dårligere!
     )
 
     # 6) Lag "syntetiske" DB‑objekter for Evaluation
