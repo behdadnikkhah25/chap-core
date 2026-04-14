@@ -1,4 +1,3 @@
-
 # chap_core/cli_endpoints/ensemble.py
 
 """Ensemble evaluation commands for CHAP CLI."""
@@ -24,7 +23,7 @@ from chap_core.database.model_templates_and_config_tables import (
     ModelConfiguration,
     ModelTemplateDB,
 )
-from chap_core.ensemble.ensemble_model import EnsembleEstimator, NonNegativeMetaModel
+from chap_core.ensemble.ensemble_model import EnsembleEstimator, NonNegativeMetaModel, ProbabilisticMetaModel
 from chap_core.log_config import initialize_logging
 from chap_core.models.model_template import ModelTemplate
 from chap_core.models.utils import CHAP_RUNS_DIR
@@ -33,115 +32,115 @@ logger = logging.getLogger(__name__)
 
 
 def evaluate_ensemble(
-    base_model_names: Annotated[
-        str,
-        Parameter(
-            help=(
-                "Kommaseparert liste med base-modeller (lokale mapper eller GitHub-URLs). "
-                "Eksempel: ../../../chap_modeller/minimalist_example_uv,"
-                "../../../chap_modeller/rwanda_random_forest"
-            )
-        ),
-    ],
-    # === datasett-argumenter, samme stil som evaluate() ===
-    dataset_name: Annotated[
-        str | None,
-        Parameter(
-            help=(
-                "Navn på innebygd datasett (som i chap evaluate), f.eks. ISIMIP_dengue_harmonized. "
-                "Hvis ikke satt, må --dataset-csv brukes."
-            )
-        ),
-    ] = None,
-    dataset_country: Annotated[
-        str | None,
-        Parameter(
-            help=(
-                "Land for multi-country datasett (f.eks. brazil for ISIMIP_dengue_harmonized). "
-                "Kreves hvis dataset_name er multi-country."
-            )
-        ),
-    ] = None,
-    dataset_csv: Annotated[
-        Path | None,
-        Parameter(
-            help=(
-                "Path til CSV med disease data (time_period, location, disease_cases, "
-                "og eventuelle kovariater). Brukes hvis dataset_name ikke er satt."
-            )
-        ),
-    ] = None,
-    polygons_json: Annotated[
-        Path | None,
-        Parameter(
-            help=(
-                "Optional: GeoJSON-fil med polygoner. "
-                "Hvis ikke satt og dataset_csv brukes, forsøkes auto-discovery."
+        base_model_names: Annotated[
+            str,
+            Parameter(
+                help=(
+                        "Kommaseparert liste med base-modeller (lokale mapper eller GitHub-URLs). "
+                        "Eksempel: ../../../chap_modeller/minimalist_example_uv,"
+                        "../../../chap_modeller/rwanda_random_forest"
+                )
             ),
-        ),
-    ] = None,
-    polygons_id_field: Annotated[
-        str | None,
-        Parameter(help="ID-felt i GeoJSON for locations (default: 'id')."),
-    ] = "id",
-    report_filename: Annotated[
-        Path,
-        Parameter(
-            help="Basisnavn for rapport (uten .csv – det lages .csv og .i.csv filer)."
-        ),
-    ] = Path("ensemble_report.csv"),
-    output_file: Annotated[
-        Path | None,
-        Parameter(
-            help=(
-                "Path for output NetCDF file containing ensemble evaluation results "
-                "(.nc extension). Hvis ikke satt, brukes report_filename med .nc-suffiks."
-            )
-        ),
-    ] = None,
-    backtest_params: Annotated[
-        BackTestParams,
-        Parameter(
-            help=(
-                "Backtest-konfigurasjon. "
-                "Bruk --backtest-params.n-periods for prediksjonshorisont, "
-                "--backtest-params.n-splits for antall train/test-splitt, "
-                "--backtest-params.stride for steg mellom splittene."
-            )
-        ),
-    ] = BackTestParams(n_periods=3, n_splits=7, stride=1),
-    run_config: Annotated[
-        RunConfig,
-        Parameter(
-            help=(
-                "Model execution config. "
-                "--run-config.is-chapkit-model, --run-config.debug, "
-                "--run-config.ignore-environment, --run-config.run-directory-type."
-            )
-        ),
-    ] = RunConfig(),
-    model_configuration_yaml: Annotated[
-        Path | None,
-        Parameter(help="(Valgfritt) YAML med konfigurasjon for ALLE basemodeller (samme fil)."),
-    ] = None,
-    data_source_mapping: Annotated[
-        Path | None,
-        Parameter(
-            help=(
-                "Optional: JSON-fil som mapper modellens kovariatnavn til CSV-kolonnenavn. "
-                'Format: {"rainfall": "precip_mm", ...}. Brukes bare hvis dataset_csv brukes.'
-            )
-        ),
-    ] = None,
-    historical_context_years: Annotated[
-        int,
-        Parameter(
-            help=(
-                "Antall år med historiske data som tas med som kontekst i evalueringen. "
-                "Brukes til plotting/visualisering (samme som i `chap eval`)."
-            )
-        ),
-    ] = 6,
+        ],
+        # === datasett-argumenter, samme stil som evaluate() ===
+        dataset_name: Annotated[
+            str | None,
+            Parameter(
+                help=(
+                        "Navn på innebygd datasett (som i chap evaluate), f.eks. ISIMIP_dengue_harmonized. "
+                        "Hvis ikke satt, må --dataset-csv brukes."
+                )
+            ),
+        ] = None,
+        dataset_country: Annotated[
+            str | None,
+            Parameter(
+                help=(
+                        "Land for multi-country datasett (f.eks. brazil for ISIMIP_dengue_harmonized). "
+                        "Kreves hvis dataset_name er multi-country."
+                )
+            ),
+        ] = None,
+        dataset_csv: Annotated[
+            Path | None,
+            Parameter(
+                help=(
+                        "Path til CSV med disease data (time_period, location, disease_cases, "
+                        "og eventuelle kovariater). Brukes hvis dataset_name ikke er satt."
+                )
+            ),
+        ] = None,
+        polygons_json: Annotated[
+            Path | None,
+            Parameter(
+                help=(
+                        "Optional: GeoJSON-fil med polygoner. "
+                        "Hvis ikke satt og dataset_csv brukes, forsøkes auto-discovery."
+                ),
+            ),
+        ] = None,
+        polygons_id_field: Annotated[
+            str | None,
+            Parameter(help="ID-felt i GeoJSON for locations (default: 'id')."),
+        ] = "id",
+        report_filename: Annotated[
+            Path,
+            Parameter(
+                help="Basisnavn for rapport (uten .csv – det lages .csv og .i.csv filer)."
+            ),
+        ] = Path("ensemble_report.csv"),
+        output_file: Annotated[
+            Path | None,
+            Parameter(
+                help=(
+                        "Path for output NetCDF file containing ensemble evaluation results "
+                        "(.nc extension). Hvis ikke satt, brukes report_filename med .nc-suffiks."
+                )
+            ),
+        ] = None,
+        backtest_params: Annotated[
+            BackTestParams,
+            Parameter(
+                help=(
+                        "Backtest-konfigurasjon. "
+                        "Bruk --backtest-params.n-periods for prediksjonshorisont, "
+                        "--backtest-params.n-splits for antall train/test-splitt, "
+                        "--backtest-params.stride for steg mellom splittene."
+                )
+            ),
+        ] = BackTestParams(n_periods=3, n_splits=7, stride=1),
+        run_config: Annotated[
+            RunConfig,
+            Parameter(
+                help=(
+                        "Model execution config. "
+                        "--run-config.is-chapkit-model, --run-config.debug, "
+                        "--run-config.ignore-environment, --run-config.run-directory-type."
+                )
+            ),
+        ] = RunConfig(),
+        model_configuration_yaml: Annotated[
+            Path | None,
+            Parameter(help="(Valgfritt) YAML med konfigurasjon for ALLE basemodeller (samme fil)."),
+        ] = None,
+        data_source_mapping: Annotated[
+            Path | None,
+            Parameter(
+                help=(
+                        "Optional: JSON-fil som mapper modellens kovariatnavn til CSV-kolonnenavn. "
+                        'Format: {"rainfall": "precip_mm", ...}. Brukes bare hvis dataset_csv brukes.'
+                )
+            ),
+        ] = None,
+        historical_context_years: Annotated[
+            int,
+            Parameter(
+                help=(
+                        "Antall år med historiske data som tas med som kontekst i evalueringen. "
+                        "Brukes til plotting/visualisering (samme som i `chap eval`)."
+                )
+            ),
+        ] = 6,
 ):
     """
     Evaluér et stacked ensemble av flere CHAP-modeller.
@@ -217,13 +216,14 @@ def evaluate_ensemble(
         )
         templates.append(tpl)
 
-    # 5) Bygg EnsembleEstimator
-    meta_model = NonNegativeMetaModel()
-    ensemble_estimator = EnsembleEstimator(
-        base_model_templates=templates,
-        meta_model=meta_model,
-        inner_val_periods=12,
-    )
+        # 5) Bygg EnsembleEstimator
+        # Velg meta-modell: Probabilistisk (CRPS) eller Deterministisk (NNLS)
+        meta_model = NonNegativeMetaModel()
+        ensemble_estimator = EnsembleEstimator(
+            base_model_templates=templates,
+            meta_model=meta_model,
+            inner_val_periods=12,
+        )
 
     # 6) Lag "syntetiske" DB‑objekter for Evaluation
     model_template_db = ModelTemplateDB(
@@ -268,7 +268,6 @@ def evaluate_ensemble(
         logger.info(f"Ensemble base model weights (percent): {weights}")
     else:
         logger.info("Ensemble base model weights not available (model not trained?).")
-
 
     # 7) Beregn globale metrics og lag CSV‑rapporter (gjenbruk save_results-format)
     flat = evaluation.to_flat()

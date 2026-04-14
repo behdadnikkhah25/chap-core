@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from scipy.optimize import nnls
+from scipy.optimize import nnls, minimize
 
 from chap_core.datatypes import FullData, Samples
 from chap_core.models.configured_model import ConfiguredModel
@@ -18,14 +18,42 @@ if TYPE_CHECKING:
     from chap_core.models.model_template import ModelTemplate
 
 
+def crps_ensemble(observations: np.ndarray, forecasts: np.ndarray) -> float:
+    """
+    Beregn CRPS (Continuous Ranked Probability Score) for ensemble-prediksjoner.
+
+    Args:
+        observations: Shape (n,) - faktiske verdier
+        forecasts: Shape (n, m) - m samples per observasjon fra ensemble
+
+    Returns:
+        Gjennomsnittlig CRPS
+
+    Teori: CRPS = integral av (CDF(x) - indicator(x >= obs))^2
+    For samples: CRPS ≈ mean(|samples - obs|) - (1/(2*M)) * mean(|sample_i - sample_j|)
+    """
+    n_samples = forecasts.shape[1]
+
+    # Term 1: Gjennomsnittlig avstand fra samples til observasjon
+    term1 = np.mean(np.abs(forecasts - observations.reshape(-1, 1)), axis=1)
+
+    # Term 2: Gjennomsnittlig parvise avstand mellom samples
+    term2 = 0.0
+    for i in range(n_samples):
+        for j in range(i + 1, n_samples):
+            term2 += np.mean(np.abs(forecasts[:, i] - forecasts[:, j]))
+
+    term2 = term2 / (n_samples * (n_samples - 1) / 2) if n_samples > 1 else 0.0
+
+    crps = np.mean(term1) - 0.5 * term2
+    return crps
+
+
 class NonNegativeMetaModel:
     """
     Meta-modell for ensemble som bruker non-negative least squares (NNLS).
-    
-    Dette sikrer at:
-    1. Alle vekter er non-negative (>= 0)
-    2. Ingen negative prediksjoner for count-data
-    3. Vekter reflekterer faktisk viktighet av hver base-modell
+
+    Optimaliserer på MSE/RMSE (deterministisk stacking).
     """
 
     def __init__(self) -> None:
@@ -36,17 +64,15 @@ class NonNegativeMetaModel:
         """
         Finner non-negative koeffisienter som minimerer ||Xw - y||^2
         hvor w >= 0 for alle elementer.
-        
+
         X shape: (n_samples, n_features) - base modell prediksjoner
         y shape: (n_samples,) - target verdier
         """
-        # NNLS løser: min ||Ax - b||^2 subject to x >= 0
         coef, _ = nnls(X, y)
         s = coef.sum()
         if s > 0:
-            coef = coef / s  # Normaliserer til vekter som summerer til 1
+            coef = coef / s
         self.coef_ = coef
-        # Intercept blir 0 siden vi jobber direkte med prediksjoner
         self.intercept_ = 0.0
         return self
 
@@ -56,9 +82,109 @@ class NonNegativeMetaModel:
         """
         if self.coef_ is None:
             raise ValueError("Modellen må fittas først")
-
-        # Vektet kombinasjon: sum(coef_i * X_i)
         return np.dot(X, self.coef_)
+
+
+class ProbabilisticMetaModel:
+    """
+    Meta-modell for PROBABILISTISK stacking (Yao et al. 2018).
+
+    Optimaliserer vekter ved å minimere CRPS på valideringssamplesene.
+    Dette sikrer at den kombinerte fordelingen er best mulig kalibrert,
+    ikke bare at midtpunktet er best.
+
+    Teorien:
+    - Vanlig stacking: min ||X*w - y||^2 (optimaliserer RMSE)
+    - Probabilistisk: min CRPS(ensemble_samples(w), y) (optimaliserer fordeling)
+    """
+
+    def __init__(self, verbose: bool = False) -> None:
+        self.coef_: np.ndarray | None = None
+        self.intercept_: float = 0.0
+        self.verbose = verbose
+        self._base_samples: list[np.ndarray] = []  # Lagre samples fra valideringen
+        self._y_val: np.ndarray | None = None
+
+    def fit(self, X_samples: list[np.ndarray], y: np.ndarray) -> ProbabilisticMetaModel:
+        """
+        Finner vekter som minimerer CRPS på valideringssamplesene.
+
+        X_samples: Liste med n_features arrays, hver shape (n_samples, n_ensemble_samples)
+                   - X_samples[i] = samples fra basemodell i
+        y: Shape (n_samples,) - observerte verdier
+        """
+        self._base_samples = X_samples
+        self._y_val = y
+
+        n_features = len(X_samples)
+
+        # Objektfunksjon: CRPS som funksjon av vekter w
+        def crps_objective(w):
+            """Beregn CRPS for gitt vekter."""
+            # Normalisér vekter til å summere til 1
+            w_norm = w / (w.sum() + 1e-10)
+
+            # Kombiner samples: ensemble_samples = sum(w_i * X_samples_i)
+            ensemble_samples = np.zeros_like(X_samples[0])
+            for i, samples in enumerate(X_samples):
+                ensemble_samples += w_norm[i] * samples
+
+            # Beregn CRPS for denne kombinasjonen
+            score = crps_ensemble(y, ensemble_samples)
+            return score
+
+        # Constraints: w >= 0
+        constraints = {'type': 'ineq', 'fun': lambda w: w}  # w_i >= 0
+
+        # Initial guess: uniform weights
+        w0 = np.ones(n_features) / n_features
+
+        # Optimiser
+        result = minimize(
+            crps_objective,
+            w0,
+            method='SLSQP',
+            constraints=constraints,
+            options={'ftol': 1e-9, 'maxiter': 1000}
+        )
+
+        if self.verbose:
+            print(f"Probabilistic meta-model fit: CRPS = {result.fun:.4f}, success = {result.success}")
+
+        # Normalisér og lagre vekter
+        coef = result.x
+        coef = coef / (coef.sum() + 1e-10)
+        self.coef_ = coef
+
+        return self
+
+    def predict(self, X_samples: list[np.ndarray]) -> np.ndarray:
+        """
+        Kombiner samples fra basemodeller med lærte vekter.
+
+        Bruker LINEÆR KOMBINASJON:
+        ensemble_samples = w1*S1 + w2*S2 + w3*S3
+
+        Dette fungerer bedre enn Quantile-Stacking fordi:
+        1. Bevarer korrelasjonsstrukturen mellom basemodeller
+        2. Gir diverse samples (ikke repetitive blokker)
+        3. Vekter optimaliseres direkte på CRPS
+
+        X_samples: Liste med arrays shape (n_predictions, n_ensemble_samples)
+        Returns: Kombinerte samples shape (n_predictions, n_ensemble_samples)
+        """
+        if self.coef_ is None:
+            raise ValueError("Modellen må fittas først")
+
+        # Lineær kombinasjon av alle modellers samples
+        ensemble_samples = np.zeros_like(X_samples[0], dtype=float)
+        for i, samples in enumerate(X_samples):
+            ensemble_samples += self.coef_[i] * samples
+
+        # Sikre ikke-negative verdier (for count-data)
+        ensemble_samples = np.maximum(ensemble_samples, 0.0)
+
+        return ensemble_samples
 
 
 @dataclass
@@ -77,23 +203,24 @@ class BaseModelSpec:
 class EnsembleEstimator(ConfiguredModel):
     """
     Ensemble-estimator som bruker holdout-stacking på tidsseriehale.
-    
+
     Støtter både deterministisk og probabilistisk output:
     - Deterministisk: punkt-prediksjoner kombinert med vekter
-    - Probabilistisk: samples generert rundt punkt-prediksjoner 
+    - Probabilistisk: samples generert rundt punkt-prediksjoner
       basert på observerte residualer fra validering
     """
 
     def __init__(
-        self,
-        base_model_templates: list[ModelTemplate] | None = None,
-        base_model_specs: Sequence[BaseModelSpec] | None = None,
-        target_column: str = "disease_cases",
-        inner_val_periods: int = 12,
-        meta_model: Any | None = None,
-        probabilistic: bool = False,
-        n_samples: int = 100,
-        **kwargs: Any,
+            self,
+            base_model_templates: list[ModelTemplate] | None = None,
+            base_model_specs: Sequence[BaseModelSpec] | None = None,
+            target_column: str = "disease_cases",
+            inner_val_periods: int = 12,
+            meta_model: Any | None = None,
+            probabilistic: bool = False,
+            probabilistic_meta_model: bool = False,
+            n_samples: int = 100,
+            **kwargs: Any,
     ) -> None:
         super().__init__()
 
@@ -114,14 +241,26 @@ class EnsembleEstimator(ConfiguredModel):
         self._base_specs = specs
         self._target_column = target_column
         self._inner_val_periods = inner_val_periods
-        self._meta_model = meta_model or NonNegativeMetaModel()
+
+        # Velg meta-modell: probabilistisk eller deterministisk
+        if meta_model is None:
+            if probabilistic_meta_model:
+                meta_model = ProbabilisticMetaModel(verbose=True)
+            else:
+                meta_model = NonNegativeMetaModel()
+
+        self._meta_model = meta_model
         self._weights_: np.ndarray | None = None
         self._feature_columns: list[str] | None = None
         self._probabilistic = probabilistic
+        self._probabilistic_meta_model = probabilistic_meta_model
         self._n_samples = n_samples
-        
+
         # For probabilistisk ensemble: lagre residualer fra basemodeller
         self._base_residuals: list[np.ndarray] = []
+
+        # For probabilistisk meta-modell: lagre samples
+        self._base_samples_val: list[np.ndarray] = []
 
         # Lagre lesbare navn på basemodellene
         base_names: list[str] = []
@@ -200,14 +339,14 @@ class EnsembleEstimator(ConfiguredModel):
 
         # NNLS sikrer non-negative koeffisienter, men sikrer med absoluttverdier
         # Hvis noen koeff er negative pga numerisk instabilitet, ta absolutt verdi
-        #coef = np.abs(coef)
+        # coef = np.abs(coef)
 
         # Normaliserer koeffisienter direkte til vekter
         # Normaliserer slik at de summerer til 100% (prosenter)
 
-        #coef_sum = coef.sum() + 1e-12
+        # coef_sum = coef.sum() + 1e-12
 
-        #weights_percent = (coef / coef_sum) * 100.0
+        # weights_percent = (coef / coef_sum) * 100.0
         weights_percent = coef * 100.0  # Direkte prosentvekter uten ytterligere normalisering
         self._weights_ = weights_percent
 
@@ -266,16 +405,53 @@ class EnsembleEstimator(ConfiguredModel):
 
         inner_predictors = [est.train(inner_train) for est in base_estimators]
 
-        # 3) Bygg nivå-2 treningsdata (X_meta, y_val)
+        # 3) Bygg nivå-2 treningsdata
         df_val = val_data.to_pandas()
         y_val = df_val[self._target_column].to_numpy()
         key_cols = ["location", "time_period"]
 
         meta_features = []
         base_residuals_list: list[np.ndarray] = []
-        
+        base_samples_list: list[np.ndarray] = []
+
         for predictor in inner_predictors:
             preds_ds = predictor.predict(inner_train, val_data)
+
+            # For probabilistisk meta-modell: lagre fulle samples
+            if self._probabilistic_meta_model:
+                df_pred = preds_ds.to_pandas()
+                sample_cols = [c for c in df_pred.columns if c.startswith("sample_")]
+
+                if sample_cols:
+                    # Hent samples direkte
+                    samples_mat = df_pred[sample_cols].to_numpy(dtype=float)
+                else:
+                    # Fallback: bruk punkt-prediksjoner kopiert til flere "samples"
+                    df_pred_flat = self._samples_to_flat_dataframe(preds_ds)
+                    merged = df_val[key_cols].merge(
+                        df_pred_flat[[*key_cols, "forecast"]],
+                        on=key_cols,
+                        how="left",
+                    )
+                    point_preds = merged["forecast"].to_numpy()
+                    # Lag "degenerert" fordeling: samme verdi repeated
+                    samples_mat = np.tile(point_preds.reshape(-1, 1), (1, self._n_samples))
+
+                # SIKRING: Sikre at alle samples-arrays har samme antall samples
+                # Hvis modellen returnerer færre samples enn self._n_samples, resample
+                n_samples_returned = samples_mat.shape[1]
+                if n_samples_returned != self._n_samples:
+                    if n_samples_returned == 1:
+                        # Replikere punkt-prediksjoner til n_samples
+                        samples_mat = np.tile(samples_mat, (1, self._n_samples))
+                    else:
+                        # Resample via bootstrap
+                        indices = np.random.choice(n_samples_returned, size=self._n_samples, replace=True)
+                        samples_mat = samples_mat[:, indices]
+
+                base_samples_list.append(samples_mat)
+
+            # For begge modeller: beregn gjennomsnitt for punkt-prediksjoner
             df_pred = self._samples_to_flat_dataframe(preds_ds)
 
             merged = df_val[key_cols].merge(
@@ -285,14 +461,14 @@ class EnsembleEstimator(ConfiguredModel):
             )
             base_preds = merged["forecast"].to_numpy()
             meta_features.append(base_preds)
-            
+
             # Beregn residualer for denne modellen
             residuals = y_val - base_preds
             base_residuals_list.append(residuals)
 
         X_meta = np.column_stack(meta_features)
 
-        # 3b) Fjern rader der målvariabelen mangler (NaN) i val-delen
+        # 3b) Fjern rader der målvariabelen mangler
         mask = ~np.isnan(y_val)
         if not np.any(mask):
             raise ValueError(
@@ -301,11 +477,14 @@ class EnsembleEstimator(ConfiguredModel):
 
         y_val_clean = y_val[mask]
         X_meta_clean = X_meta[mask, :]
-        
+
         # Filtrer residualer samme måte
         base_residuals_clean = [res[mask] for res in base_residuals_list]
 
-        # 3c) Sjekk for NaN i meta-features fra basemodellene
+        # Filtrer samples samme måte
+        base_samples_clean = [samp[mask, :] for samp in base_samples_list] if base_samples_list else []
+
+        # 3c) Sjekk for NaN i meta-features
         nan_in_X = np.any(np.isnan(X_meta_clean), axis=1)
         if np.any(nan_in_X):
             import logging
@@ -320,6 +499,7 @@ class EnsembleEstimator(ConfiguredModel):
             X_meta_clean = X_meta_clean[valid_mask]
             y_val_clean = y_val_clean[valid_mask]
             base_residuals_clean = [res[valid_mask] for res in base_residuals_clean]
+            base_samples_clean = [samp[valid_mask, :] for samp in base_samples_clean]
 
         if len(y_val_clean) == 0:
             raise ValueError(
@@ -327,14 +507,21 @@ class EnsembleEstimator(ConfiguredModel):
                 "Sjekk at basemodellene produserer gyldige prediksjoner."
             )
 
-        # 4) Tren meta-modellen og hent vekter
-        self._meta_model.fit(X_meta_clean, y_val_clean)
-        self._compute_weights_from_meta(X_meta_clean, y_val_clean)
-        
-        # 5) Lagre residualer alltid (brukes av probabilistisk modus)
-        self._base_residuals = base_residuals_clean
+        # 4) Tren meta-modellen
+        if self._probabilistic_meta_model:
+            # Probabilistisk: optimer CRPS på samples
+            self._meta_model.fit(base_samples_clean, y_val_clean)
+        else:
+            # Deterministisk: optimer MSE på punkt-prediksjoner
+            self._meta_model.fit(X_meta_clean, y_val_clean)
 
-        # 6) Tren basemodeller på full train_data for slutt-prediktor
+        self._compute_weights_from_meta(X_meta_clean, y_val_clean)
+
+        # 5) Lagre residualer alltid
+        self._base_residuals = base_residuals_clean
+        self._base_samples_val = base_samples_clean
+
+        # 6) Tren basemodeller på full train_data
         full_predictors = []
         for estimator in base_estimators:
             full_predictor = estimator.train(train_data)
@@ -345,6 +532,7 @@ class EnsembleEstimator(ConfiguredModel):
             base_predictors=full_predictors,
             meta_model=self._meta_model,
             probabilistic=self._probabilistic,
+            probabilistic_meta_model=self._probabilistic_meta_model,
             n_samples=self._n_samples,
             base_residuals=self._base_residuals,
         )
@@ -412,125 +600,201 @@ class EnsembleEstimator(ConfiguredModel):
             "EnsembleEstimator brukes kun via train() som returnerer EnsemblePredictor."
         )
 
+
 class EnsemblePredictor:
     """
     Bruker trenede basemodeller + meta-modell til å produsere ensemble-prediksjoner.
-    
-    Støtter to modi:
-    - Deterministisk: punkt-prediksjoner kombinert med vekter
-    - Probabilistisk: samples rundt punkt-prediksjoner basert på 
-                      observerte residualer fra validering
+
+    Støtter to meta-modeller:
+    - Deterministisk (NNLS): punkt-prediksjoner kombinert med vekter som minimerer MSE
+    - Probabilistisk (CRPS): samples kombinert med vekter som minimerer CRPS
+
+    Og to output-modi:
+    - Deterministisk: punkt-prediksjoner (1 sample per periode)
+    - Probabilistisk: samples rundt punkt-prediksjoner basert på residualer
     """
 
     def __init__(
-        self,
-        target_column: str,
-        base_predictors: Sequence[Any],
-        meta_model: Any,
-        probabilistic: bool = False,
-        n_samples: int = 100,
-        base_residuals: list[np.ndarray] | None = None,
+            self,
+            target_column: str,
+            base_predictors: Sequence[Any],
+            meta_model: Any,
+            probabilistic: bool = False,
+            probabilistic_meta_model: bool = False,
+            n_samples: int = 100,
+            base_residuals: list[np.ndarray] | None = None,
     ) -> None:
         self._target_column = target_column
         self._base_predictors = list(base_predictors)
         self._meta_model = meta_model
         self._probabilistic = probabilistic
+        self._probabilistic_meta_model = probabilistic_meta_model
         self._n_samples = n_samples
         self._base_residuals = base_residuals or []
 
     def predict(
-        self,
-        historic_data: DataSet,
-        future_data: DataSet,
+            self,
+            historic_data: DataSet,
+            future_data: DataSet,
     ) -> DataSet[Samples]:
         """
         CHAP-konsistent predict: returnerer DataSet[Samples].
-        
-        - Hvis probabilistic=True ELLER residualer er tilgjengelige:
-          Genererer samples basert på residual-fordeling
-        - Ellers: punkt-prediksjoner (deterministisk)
+
+        To modi:
+        1. Probabilistisk Meta-Modell (ProbabilisticMetaModel):
+           - Kombinerer samples direkte med Quantile-Stacking
+           - RETURNER BARE de kombinerte samples (IKKE residualer!)
+           - Gir optimal CRPS-kalibrering
+
+        2. Deterministisk Meta-Modell (NonNegativeMetaModel):
+           - Kombinerer punkt-prediksjoner
+           - Generer samples rundt dem via bootstrap-residualer
+           - Gir diverse samples basert på observert usikkerhet
         """
         df_future = future_data.to_pandas()
         key_cols = ["location", "time_period"]
 
-        # 1) Samle basemodellprediksjoner for alle rader
-        meta_features = []
-        for predictor in self._base_predictors:
-            preds_ds = predictor.predict(historic_data, future_data)
-            df_pred = EnsembleEstimator._samples_to_flat_dataframe(preds_ds)
+        # MODUS 1: ProbabilisticMetaModel
+        if self._probabilistic_meta_model:
+            base_samples_future: list[np.ndarray] = []
 
-            merged = df_future[key_cols].merge(
-                df_pred[[*key_cols, "forecast"]],
-                on=key_cols,
-                how="left",
-            )
-            meta_features.append(merged["forecast"].to_numpy())
+            for predictor in self._base_predictors:
+                preds_ds = predictor.predict(historic_data, future_data)
+                df_pred = preds_ds.to_pandas()
 
-        X_meta_future = np.column_stack(meta_features)
+                sample_cols = [c for c in df_pred.columns if c.startswith("sample_")]
 
-        # 2) Hent meta-vekter
-        if not hasattr(self._meta_model, "coef_") or self._meta_model.coef_ is None:
-            raise ValueError("Meta-modellen må være trent.")
+                if sample_cols:
+                    samples_mat = df_pred[sample_cols].to_numpy(dtype=float)
+                else:
+                    # Fallback: punkt-prediksjon replikert til n_samples
+                    df_pred_flat = EnsembleEstimator._samples_to_flat_dataframe(preds_ds)
+                    merged = df_future[key_cols].merge(
+                        df_pred_flat[[*key_cols, "forecast"]],
+                        on=key_cols,
+                        how="left",
+                    )
+                    point_preds = merged["forecast"].to_numpy()
+                    samples_mat = np.tile(point_preds.reshape(-1, 1), (1, self._n_samples))
 
-        weights = np.asarray(self._meta_model.coef_, dtype=float)
-        if weights.ndim == 2:
-            weights = weights[0]
-        
-        # Sikre positive vekter
-        weights = np.abs(weights)
-        w_sum = weights.sum()
-        if w_sum <= 0:
-            raise ValueError("Meta-vekter har sum <= 0.")
-        weights = weights / w_sum
+                # Sikre konsistent antall samples
+                n_samples_returned = samples_mat.shape[1]
+                if n_samples_returned != self._n_samples:
+                    if n_samples_returned == 1:
+                        samples_mat = np.tile(samples_mat, (1, self._n_samples))
+                    else:
+                        indices = np.random.choice(
+                            n_samples_returned, size=self._n_samples, replace=True
+                        )
+                        samples_mat = samples_mat[:, indices]
 
-        # 3) Velg modus: probabilistisk hvis vi har residualer ELLER probabilistic=True
-        has_residuals = self._base_residuals and len(self._base_residuals) > 0
-        
-        if self._probabilistic or has_residuals:
-            return self._predict_probabilistic(
-                X_meta_future, weights, df_future, future_data
-            )
-        else:
-            # Deterministisk fallback: vektet kombinasjon av punkt-prediksjoner
-            y_pred = self._meta_model.predict(X_meta_future)
-            df_out = df_future.copy()
-            df_out["forecast"] = y_pred
+                base_samples_future.append(samples_mat)
 
+            # ✅ QUANTILE-STACKING kombinerer samples med bevart fordeling
+            ensemble_samples = self._meta_model.predict(base_samples_future)
+
+            # ✅ RETURNÉR BARE kombinerte samples - IKKE residualer!
+            # (Residualer ville ødela kalibreringen som meta-modellen optimaliserte)
+
+            # Pakk tilbake til DataSet[Samples]
             result: dict[Any, Samples] = {}
-            df_out = df_out.sort_values(["location", "time_period"])
 
-            for loc in sorted(df_out["location"].unique()):
-                mask = df_out["location"] == loc
-                df_loc = df_out[mask].copy()
+            for loc in sorted(future_data.locations()):
+                mask = df_future["location"] == loc
+                loc_rows_idx = np.where(np.asarray(mask))[0]
 
                 future_sample = future_data[loc]
                 tp = future_sample.time_period
 
-                preds_loc = df_loc["forecast"].to_numpy()
-                if len(preds_loc) != len(tp):
+                if len(loc_rows_idx) != len(tp):
                     raise ValueError(
-                        f"Lengde på prediksjoner stemmer ikke for location {loc!r}"
+                        f"Antall rader for {loc} matcher ikke time_period"
                     )
 
-                samples_arr = np.asarray(preds_loc, dtype=float).reshape(-1, 1)
-                samples = Samples(samples=samples_arr, time_period=tp)
-                result[loc] = samples
+                loc_samples = ensemble_samples[loc_rows_idx, :]
+                samples_obj = Samples(samples=loc_samples, time_period=tp)
+                result[loc] = samples_obj
 
             return DataSet(result)
 
+        # MODUS 2: Deterministisk Meta-Modell + Bootstrap-Residualer
+        else:
+            meta_features = []
+            for predictor in self._base_predictors:
+                preds_ds = predictor.predict(historic_data, future_data)
+                df_pred = EnsembleEstimator._samples_to_flat_dataframe(preds_ds)
+
+                merged = df_future[key_cols].merge(
+                    df_pred[[*key_cols, "forecast"]],
+                    on=key_cols,
+                    how="left",
+                )
+                meta_features.append(merged["forecast"].to_numpy())
+
+            X_meta_future = np.column_stack(meta_features)
+
+            # Hent vekter fra meta-modellen
+            if not hasattr(self._meta_model, "coef_") or self._meta_model.coef_ is None:
+                raise ValueError("Meta-modellen må være trent.")
+
+            weights = np.asarray(self._meta_model.coef_, dtype=float)
+            if weights.ndim == 2:
+                weights = weights[0]
+
+            weights = np.abs(weights)
+            w_sum = weights.sum()
+            if w_sum <= 0:
+                raise ValueError("Meta-vekter har sum <= 0.")
+            weights = weights / w_sum
+
+            # Velg: hvis probabilistic eller har residualer, generer samples
+            has_residuals = self._base_residuals and len(self._base_residuals) > 0
+
+            if self._probabilistic or has_residuals:
+                return self._predict_probabilistic(
+                    X_meta_future, weights, df_future, future_data
+                )
+            else:
+                # Deterministisk: bare punkt-prediksjoner
+                y_pred = self._meta_model.predict(X_meta_future)
+                df_out = df_future.copy()
+                df_out["forecast"] = y_pred
+
+                result: dict[Any, Samples] = {}
+                df_out = df_out.sort_values(["location", "time_period"])
+
+                for loc in sorted(df_out["location"].unique()):
+                    mask = df_out["location"] == loc
+                    df_loc = df_out[mask].copy()
+
+                    future_sample = future_data[loc]
+                    tp = future_sample.time_period
+
+                    preds_loc = df_loc["forecast"].to_numpy()
+                    if len(preds_loc) != len(tp):
+                        raise ValueError(
+                            f"Lengde på prediksjoner stemmer ikke for location {loc!r}"
+                        )
+
+                    samples_arr = np.asarray(preds_loc, dtype=float).reshape(-1, 1)
+                    samples = Samples(samples=samples_arr, time_period=tp)
+                    result[loc] = samples
+
+                return DataSet(result)
+
     def _predict_probabilistic(
-        self,
-        X_meta_future: np.ndarray,
-        weights: np.ndarray,
-        df_future: Any,
-        future_data: DataSet,
+            self,
+            X_meta_future: np.ndarray,
+            weights: np.ndarray,
+            df_future: Any,
+            future_data: DataSet,
     ) -> DataSet[Samples]:
         """
         Generer probabilistiske samples rundt punkt-prediksjoner.
-        
+
         For hver basemodell-prediksjon, tegn samples fra residual-fordelingen
         observert under trening, vekt dem, og kombinér.
-        
+
         VIKTIG: Denne metoden håndterer både deterministiske og probabilistiske basemodeller.
         """
         n_rows = X_meta_future.shape[0]
@@ -564,10 +828,10 @@ class EnsemblePredictor:
 
         for model_idx in range(len(self._base_residuals)):
             residuals = self._base_residuals[model_idx]
-            
+
             # Fjern NaN residualer
             residuals_clean = residuals[~np.isnan(residuals)]
-            
+
             if len(residuals_clean) == 0:
                 # Hvis ingen residualer for denne modellen, bruk punkt-prediksjon
                 for row_idx in range(n_rows):
@@ -577,7 +841,7 @@ class EnsemblePredictor:
 
             # Beregn empirisk standardavvik av residualer
             residual_std = np.std(residuals_clean)
-            
+
             # For hver prediksjon: tegn samples fra residual-fordelingen
             for row_idx in range(n_rows):
                 # Tegn S samples fra observerte residualer (med replacement)
@@ -587,10 +851,10 @@ class EnsemblePredictor:
                 # Legg til residualer til punkt-prediksjonen
                 model_base_pred = X_meta_future[row_idx, model_idx]
                 model_samples = model_base_pred + sampled_residuals
-                
+
                 # Sikre at prediksjoner ikke blir negative (for count-data)
                 model_samples = np.maximum(model_samples, 0.0)
-                
+
                 # Vekt med modell-vekt
                 ensemble_samples[row_idx, :] += weights[model_idx] * model_samples
 
