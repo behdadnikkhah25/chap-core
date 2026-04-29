@@ -1,2 +1,0 @@
-Model,ratio_above_truth,crps,crps_log1p,crps_norm,example_metric,mae,sensitivity,specificity,outbreak_accuracy,coverage_10_90,coverage_25_75,rmse,sample_count,winkler_score_10_90,winkler_score_25_75,winkler_score_10_90_log1p,winkler_score_25_75_log1p
-ensemble,0.5694444444444444,120.52508955897707,1.025614767504039,0.06203041150745089,17355.612896492697,120.52508955897707,,,,0.0,0.0,192.23810094003161,144.0,1205.2508955897708,482.1003582359083,10.25614767504039,4.102459070016156
