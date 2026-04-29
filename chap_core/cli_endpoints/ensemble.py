@@ -1,6 +1,4 @@
-# chap_core/cli_endpoints/ensemble.py
-
-"""Ensemble CLI endpoints (canonical implementation)."""
+"""Ensemble CLI endpoints."""
 
 from __future__ import annotations
 
@@ -35,6 +33,94 @@ from chap_core.models.utils import CHAP_RUNS_DIR
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "_evaluate_ensemble_core",
+    "_save_reports",
+    "evaluate_ensemble",
+    "register_commands",
+]
+
+
+def _load_dataset(
+    *,
+    dataset_name: str | None,
+    dataset_country: str | None,
+    dataset_csv: Path | None,
+    polygons_json: Path | None,
+    polygons_id_field: str,
+    data_source_mapping: Path | None,
+) -> object:
+    if dataset_name:
+        return load_dataset(
+            dataset_country=dataset_country,
+            dataset_csv=None,
+            dataset_name=dataset_name,
+            polygons_id_field=polygons_id_field,
+            polygons_json=polygons_json,
+        )
+
+    if dataset_csv is None:
+        raise ValueError("Specify either --dataset-name or --dataset-csv")
+
+    column_mapping = None
+    if data_source_mapping is not None:
+        with open(data_source_mapping) as f:
+            column_mapping = json.load(f)
+    geojson = polygons_json or discover_geojson(dataset_csv)
+    return load_dataset_from_csv(dataset_csv, geojson, column_mapping)
+
+
+def _load_configuration(model_configuration_yaml: Path | None) -> ModelConfiguration | None:
+    if model_configuration_yaml is None:
+        return None
+    with open(model_configuration_yaml) as f:
+        return ModelConfiguration.model_validate(yaml.safe_load(f))
+
+
+def _load_templates(base_model_names: str, run_config: RunConfig) -> list[ModelTemplate]:
+    _, base_model_list = create_model_lists(model_configuration_yaml=None, model_name=base_model_names)
+
+    templates: list[ModelTemplate] = []
+    for name in base_model_list:
+        logger.info("Loading base model template from %s", name)
+        templates.append(
+            ModelTemplate.from_directory_or_github_url(
+                name,
+                base_working_dir=CHAP_RUNS_DIR,
+                ignore_env=run_config.ignore_environment,
+                run_dir_type=run_config.run_directory_type,
+                is_chapkit_model=run_config.is_chapkit_model,
+            )
+        )
+    return templates
+
+
+def _compute_metrics(flat: Any, ensemble_method: str) -> tuple[str, dict[str, float | str], pd.DataFrame]:
+    metrics_dict: dict[str, float | str] = {}
+    forecasts_df = pd.DataFrame(cast("Any", flat.forecasts))
+    for metric_id, metric_cls in available_metrics.items():
+        metric = metric_cls()
+        try:
+            df_metric = metric.get_global_metric(flat.observations, forecasts_df)
+            if len(df_metric) == 1:
+                metrics_dict[metric_id] = float(df_metric["metric"].iloc[0])
+        except Exception as exc:
+            logger.warning("Failed to compute metric %s: %s", metric_id, exc)
+
+    model_key = f"ensemble_{ensemble_method}"
+    metrics_dict["model_name"] = model_key
+    metrics_dict["ensemble_method"] = ensemble_method
+    return model_key, metrics_dict, forecasts_df
+
+
+def _save_reports(
+    report_filename: Path,
+    results: dict[str, tuple[dict[str, float | str], object]],
+    forecasts: pd.DataFrame,
+) -> None:
+    del forecasts
+    save_results(str(report_filename), results)
+
 
 def _evaluate_ensemble_core(
     *,
@@ -59,45 +145,17 @@ def _evaluate_ensemble_core(
     initialize_logging(run_config.debug, run_config.log_file)
     logger.info("Evaluating ensemble with base models: %s", base_model_names)
 
-    # 1) Dataset
-    if dataset_name:
-        dataset = load_dataset(
-            dataset_country=dataset_country,
-            dataset_csv=None,
-            dataset_name=dataset_name,
-            polygons_id_field=polygons_id_field,
-            polygons_json=polygons_json,
-        )
-    else:
-        if dataset_csv is None:
-            raise ValueError("Specify either --dataset-name or --dataset-csv")
-        column_mapping = None
-        if data_source_mapping is not None:
-            with open(data_source_mapping) as f:
-                column_mapping = json.load(f)
-        geojson = polygons_json or discover_geojson(dataset_csv)
-        dataset = load_dataset_from_csv(dataset_csv, geojson, column_mapping)
+    configuration = _load_configuration(model_configuration_yaml)
+    dataset = _load_dataset(
+        dataset_name=dataset_name,
+        dataset_country=dataset_country,
+        dataset_csv=dataset_csv,
+        polygons_json=polygons_json,
+        polygons_id_field=polygons_id_field,
+        data_source_mapping=data_source_mapping,
+    )
 
-    # 2) Base modeller
-    _, base_model_list = create_model_lists(model_configuration_yaml=None, model_name=base_model_names)
-
-    configuration: ModelConfiguration | None = None
-    if model_configuration_yaml is not None:
-        with open(model_configuration_yaml) as f:
-            configuration = ModelConfiguration.model_validate(yaml.safe_load(f))
-
-    templates: list[ModelTemplate] = []
-    for name in base_model_list:
-        logger.info("Loading base model template from %s", name)
-        templates.append(
-            ModelTemplate.from_directory_or_github_url(
-                name,
-                base_working_dir=CHAP_RUNS_DIR,
-                ignore_env=run_config.ignore_environment,
-                run_dir_type=run_config.run_directory_type,
-                is_chapkit_model=run_config.is_chapkit_model,
-            )
-        )
+    templates = _load_templates(base_model_names, run_config)
 
     if ensemble_method not in ("deterministic", "probabilistic"):
         raise ValueError(f"ensemble_method must be 'deterministic' or 'probabilistic', not {ensemble_method!r}")
@@ -109,17 +167,15 @@ def _evaluate_ensemble_core(
         backtest_params.stride,
     )
 
-    # 3) Bygg ensemble
     ensemble = EnsembleModel(
         base_templates=templates,
         method=ensemble_method,
         inner_val_periods=12,
         target_col="disease_cases",
         n_samples=100,
-        use_residual_bootstrap= False,
+        use_residual_bootstrap=False,
     )
 
-    # 4) Evaluation / backtest
     model_db = ModelTemplateDB(id=model_template_id, name=model_template_id, version="0.1")
     configured_db = ConfiguredModelDB(
         id=configured_model_id,
@@ -144,33 +200,10 @@ def _evaluate_ensemble_core(
     if ensemble.weights is not None:
         logger.info("Ensemble base model weights (percent): %s", ensemble.weights)
 
-    # 5) Metrikker + forecasts
     flat = evaluation.to_flat()
-
-    # Viktig: flat.forecasts er allerede en DataFrame med riktig struktur.
-    forecasts_df = cast(pd.DataFrame, flat.forecasts)
-
-    metrics_dict: dict[str, float | str] = {}
-    for metric_id, metric_cls in available_metrics.items():
-        metric = metric_cls()
-        try:
-            df_metric = metric.get_global_metric(flat.observations, forecasts_df)
-            if len(df_metric) == 1:
-                metrics_dict[metric_id] = float(df_metric["metric"].iloc[0])
-        except Exception as exc:
-            logger.warning("Failed to compute metric %s: %s", metric_id, exc)
-
-    model_key = f"ensemble_{ensemble_method}"
-    metrics_dict["model_name"] = model_key
-    metrics_dict["ensemble_method"] = ensemble_method
-
-    results: dict[str, tuple[dict[str, float | str], pd.DataFrame]] = {
-        model_key: (metrics_dict, forecasts_df)
-    }
-
-    # MANGLET: skriv filene og returner
-    save_results(str(report_filename), results)
-    logger.info("Saved ensemble results to %s (and .0.csv, .1.csv, ...)", report_filename)
+    model_key, metrics_dict, forecasts_df = _compute_metrics(flat, ensemble_method)
+    results: dict[str, tuple[dict[str, float | str], pd.DataFrame]] = {model_key: (metrics_dict, forecasts_df)}
+    _save_reports(report_filename, results, forecasts_df)
     return results
 
 
