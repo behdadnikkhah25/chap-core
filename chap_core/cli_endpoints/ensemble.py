@@ -26,6 +26,7 @@ from chap_core.database.model_templates_and_config_tables import (
     ModelConfiguration,
     ModelTemplateDB,
 )
+from chap_core.ensemble._legacy_wrappers import _TemplateWithConfig
 from chap_core.ensemble.ensemble_model import EnsembleModel
 from chap_core.log_config import initialize_logging
 from chap_core.models.model_template import ModelTemplate
@@ -70,31 +71,6 @@ def _load_dataset(
     return load_dataset_from_csv(dataset_csv, geojson, column_mapping)
 
 
-def _load_configuration(model_configuration_yaml: Path | None) -> ModelConfiguration | None:
-    if model_configuration_yaml is None:
-        return None
-    with open(model_configuration_yaml) as f:
-        return ModelConfiguration.model_validate(yaml.safe_load(f))
-
-
-def _load_templates(base_model_names: str, run_config: RunConfig) -> list[ModelTemplate]:
-    _, base_model_list = create_model_lists(model_configuration_yaml=None, model_name=base_model_names)
-
-    templates: list[ModelTemplate] = []
-    for name in base_model_list:
-        logger.info("Loading base model template from %s", name)
-        templates.append(
-            ModelTemplate.from_directory_or_github_url(
-                name,
-                base_working_dir=CHAP_RUNS_DIR,
-                ignore_env=run_config.ignore_environment,
-                run_dir_type=run_config.run_directory_type,
-                is_chapkit_model=run_config.is_chapkit_model,
-            )
-        )
-    return templates
-
-
 def _compute_metrics(flat: Any, ensemble_method: str) -> tuple[str, dict[str, float | str], pd.DataFrame]:
     metrics_dict: dict[str, float | str] = {}
     forecasts_df = pd.DataFrame(cast("Any", flat.forecasts))
@@ -135,7 +111,8 @@ def _evaluate_ensemble_core(
     output_file: Path | None,
     backtest_params: BackTestParams,
     run_config: RunConfig,
-    model_configuration_yaml: Path | None,
+    model_configuration_yaml: str | None,
+    random_state: int | None,
     data_source_mapping: Path | None,
     historical_context_years: int,
     model_template_id: str,
@@ -145,7 +122,6 @@ def _evaluate_ensemble_core(
     initialize_logging(run_config.debug, run_config.log_file)
     logger.info("Evaluating ensemble with base models: %s", base_model_names)
 
-    configuration = _load_configuration(model_configuration_yaml)
     dataset = _load_dataset(
         dataset_name=dataset_name,
         dataset_country=dataset_country,
@@ -154,8 +130,6 @@ def _evaluate_ensemble_core(
         polygons_id_field=polygons_id_field,
         data_source_mapping=data_source_mapping,
     )
-
-    templates = _load_templates(base_model_names, run_config)
 
     if ensemble_method not in ("deterministic", "probabilistic"):
         raise ValueError(f"ensemble_method must be 'deterministic' or 'probabilistic', not {ensemble_method!r}")
@@ -167,14 +141,41 @@ def _evaluate_ensemble_core(
         backtest_params.stride,
     )
 
+    model_configuration_yaml_list, base_model_list = create_model_lists(
+        model_configuration_yaml=model_configuration_yaml,
+        model_name=base_model_names,
+    )
+    logger.info("Model configurations: %s", model_configuration_yaml_list)
+
+    base_templates_with_config: list[_TemplateWithConfig] = []
+    for name, cfg_yaml in zip(base_model_list, model_configuration_yaml_list, strict=False):
+        logger.info("Loading base model template from %s", name)
+        template = ModelTemplate.from_directory_or_github_url(
+            name,
+            base_working_dir=CHAP_RUNS_DIR,
+            ignore_env=run_config.ignore_environment,
+            run_dir_type=run_config.run_directory_type,
+            is_chapkit_model=run_config.is_chapkit_model,
+        )
+
+        model_config: ModelConfiguration | None = None
+        if cfg_yaml is not None:
+            logger.info("Loading model configuration from yaml file %s", cfg_yaml)
+            with open(cfg_yaml, encoding="utf-8") as f:
+                cfg_data = yaml.safe_load(f)
+            model_config = ModelConfiguration.model_validate(cfg_data)
+            logger.info("Loaded model configuration for %s", name)
+
+        base_templates_with_config.append(_TemplateWithConfig(template, model_config))
+
     ensemble = EnsembleModel(
-        base_templates=templates,
+        base_templates=base_templates_with_config,
         method=ensemble_method,
         inner_val_periods=12,
         target_col="disease_cases",
         n_samples=100,
         use_residual_bootstrap=False,
-        random_state=42,
+        random_state=random_state,
     )
 
     model_db = ModelTemplateDB(id=model_template_id, name=model_template_id, version="0.1")
@@ -182,7 +183,7 @@ def _evaluate_ensemble_core(
         id=configured_model_id,
         model_template_id=model_db.id,
         model_template=model_db,
-        configuration=configuration.model_dump() if configuration else {},
+        configuration={},  # flere base-modeller, derfor ingen enkel samlet config
     )
 
     evaluation = Evaluation.create(
@@ -228,7 +229,19 @@ def evaluate_ensemble(
         n_periods=3, n_splits=7, stride=1
     ),
     run_config: Annotated[RunConfig, Parameter(help="Model execution config.")] = RunConfig(),
-    model_configuration_yaml: Annotated[Path | None, Parameter(help="Valgfri YAML for basemodeller.")] = None,
+    model_configuration_yaml: Annotated[
+        str | None,
+        Parameter(
+            help=(
+                "Valgfri kommaseparert liste med YAML-filer for base-modellkonfigurasjoner. "
+                "Må ha samme rekkefølge/lengde som --base-model-names."
+            )
+        ),
+    ] = None,
+    random_state: Annotated[
+        int | None,
+        Parameter(help="Random seed for ensemble-meta-modellen (f.eks. 42)."),
+    ] = 42,
     data_source_mapping: Annotated[Path | None, Parameter(help="Optional JSON kolonne-mapping.")] = None,
     historical_context_years: Annotated[
         int,
@@ -248,6 +261,7 @@ def evaluate_ensemble(
         backtest_params=backtest_params,
         run_config=run_config,
         model_configuration_yaml=model_configuration_yaml,
+        random_state=random_state,
         data_source_mapping=data_source_mapping,
         historical_context_years=historical_context_years,
         model_template_id="ensemble_model",
