@@ -37,6 +37,7 @@ class EnsembleModel(ConfiguredModel):
         n_samples: int = 100,
         use_residual_bootstrap: bool = False,
         meta_model: NonNegativeMetaModel | ProbabilisticMetaModel | None = None,
+        random_state: int | None = None,
     ) -> None:
         super().__init__()
         self.base_templates = list(base_templates or [])
@@ -52,6 +53,7 @@ class EnsembleModel(ConfiguredModel):
         self.meta_model: NonNegativeMetaModel | ProbabilisticMetaModel | None = meta_model
         self.weights: np.ndarray | None = None
         self._base_residuals: list[np.ndarray] = []
+        self.random_state: int = random_state
 
     def _base_names(self) -> list[str]:
         names: list[str] = []
@@ -67,6 +69,9 @@ class EnsembleModel(ConfiguredModel):
         return names
 
     def train(self, train_data: DataSet, extra_args: Any = None) -> EnsemblePredictor:
+        # Lokal RNG for reproduserbarhet
+        rng = np.random.default_rng(self.random_state)
+
         df = train_data.to_pandas()
         all_periods = sorted(df["time_period"].dropna().astype(str).unique())
         split_idx = (
@@ -75,7 +80,10 @@ class EnsembleModel(ConfiguredModel):
             else len(all_periods) - self.inner_val_periods
         )
         logger.info(
-            "Inner split: %d periods, train=%d, val=%d", len(all_periods), split_idx, len(all_periods) - split_idx
+            "Inner split: %d periods, train=%d, val=%d",
+            len(all_periods),
+            split_idx,
+            len(all_periods) - split_idx,
         )
 
         train_mask = df["time_period"].astype(str).isin(set(all_periods[:split_idx]))
@@ -102,7 +110,12 @@ class EnsembleModel(ConfiguredModel):
         meta_mat: np.ndarray | None = None
         if self.method == "probabilistic":
             meta_list = [
-                _SampleExtractor.reshape_samples(p.predict(inner_train, val_data), df_val, self.n_samples)
+                _SampleExtractor.reshape_samples(
+                    p.predict(inner_train, val_data),
+                    df_val,
+                    self.n_samples,
+                    rng=rng,  # <- bruker samme rng
+                )
                 for p in preds_inner
             ]
         else:
@@ -169,6 +182,7 @@ class EnsembleModel(ConfiguredModel):
             n_samples=self.n_samples,
             use_residual_bootstrap=self.use_residual_bootstrap,
             base_residuals=self._base_residuals,
+            rng=rng,  # <- send rng videre
         )
 
     def predict(self, historic_data: DataSet, future_data: DataSet) -> DataSet:

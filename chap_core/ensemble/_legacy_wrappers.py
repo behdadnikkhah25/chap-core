@@ -1,4 +1,4 @@
-"""Legacy compatibility wrappers for ensemble model templates."""
+# chap_core/ensemble/_legacy_wrappers.py
 
 from __future__ import annotations
 
@@ -20,9 +20,8 @@ class _TemplateWithConfig:
         self._template = template
         self._config = config
 
-    def get_model(self, _: Any) -> Any:
-        if self._config is None or isinstance(self._config, dict):
-            return self._template.get_model(None)
+    def get_model(self, _: Any = None) -> Any:
+        # Alltid videresend config til template; None betyr “default config”
         return self._template.get_model(self._config)
 
     def __getattr__(self, item: str) -> Any:

@@ -25,6 +25,7 @@ class EnsemblePredictor:
         n_samples: int,
         use_residual_bootstrap: bool = False,
         base_residuals: list[np.ndarray] | None = None,
+        rng: np.random.Generator | None = None,
     ) -> None:
         self._predictors = list(predictors)
         self._meta = meta
@@ -32,6 +33,7 @@ class EnsemblePredictor:
         self._n_samples = n_samples
         self._use_residual_bootstrap = use_residual_bootstrap
         self._base_residuals = base_residuals or []
+        self._rng = rng or np.random.default_rng()
 
     def predict(self, historic_data: DataSet, future_data: DataSet) -> DataSet[Samples]:
         df_future = future_data.to_pandas()
@@ -39,7 +41,7 @@ class EnsemblePredictor:
 
         if self._prob:
             base_samp = [
-                _SampleExtractor.reshape_samples(p.predict(historic_data, future_data), df_future, self._n_samples)
+                _SampleExtractor.reshape_samples(p.predict(historic_data, future_data), df_future, self._n_samples,  rng=self._rng)
                 for p in self._predictors
             ]
             ens_samp = self._meta.predict(base_samp)  # type: ignore[arg-type]
@@ -71,7 +73,7 @@ class EnsemblePredictor:
                         ens_samp[row_idx, :] += w[model_idx] * X_meta_future[row_idx, model_idx]
                     continue
                 for row_idx in range(n_rows):
-                    sampled_res = np.random.choice(res_clean, size=s_count, replace=True)
+                    sampled_res = self._rng.choice(res_clean, size=s_count, replace=True)
                     base_pred = X_meta_future[row_idx, model_idx]
                     model_samples = np.maximum(base_pred + sampled_res, 0.0)
                     ens_samp[row_idx, :] += w[model_idx] * model_samples

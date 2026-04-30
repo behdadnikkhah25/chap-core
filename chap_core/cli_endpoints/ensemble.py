@@ -174,6 +174,7 @@ def _evaluate_ensemble_core(
         target_col="disease_cases",
         n_samples=100,
         use_residual_bootstrap=False,
+        random_state=42,
     )
 
     model_db = ModelTemplateDB(id=model_template_id, name=model_template_id, version="0.1")
