@@ -1,6 +1,7 @@
 import numpy as np
 
 from chap_core.ensemble.ensemble_model import EnsembleModel
+from chap_core.ensemble._meta_models import NonNegativeMetaModel
 
 
 def test_deterministic_predict_shape_and_weights(weekly_full_data, constant_template_factory):
@@ -15,12 +16,31 @@ def test_deterministic_predict_shape_and_weights(weekly_full_data, constant_temp
 
     assert model.weights is not None
     assert len(model.weights) == 2
-    assert np.isclose(float(np.sum(model.weights)), 100.0, atol=1e-6)
+    assert np.all(model.weights >= 0)
 
     for loc in weekly_full_data.locations():
         samples = preds[loc].samples
         assert samples.shape[1] == 1
         assert samples.shape[0] == len(weekly_full_data[loc].time_period)
+
+
+def test_deterministic_weights_preserve_nnls_scale(weekly_full_data, constant_template_factory, monkeypatch):
+    templates = [
+        constant_template_factory(5.0, 1, "model_a"),
+        constant_template_factory(10.0, 1, "model_b"),
+    ]
+
+    def fake_fit(self, _X, _y):
+        self.coef_ = np.array([0.4, 0.4], dtype=float)
+        return self
+
+    monkeypatch.setattr(NonNegativeMetaModel, "fit", fake_fit)
+
+    model = EnsembleModel(base_templates=templates, method="deterministic", n_samples=5)
+    model.train(weekly_full_data)
+
+    assert model.weights is not None
+    np.testing.assert_allclose(model.weights, np.array([0.4, 0.4], dtype=float))
 
 
 def test_probabilistic_predict_samples_count(weekly_full_data, constant_template_factory):

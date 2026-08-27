@@ -24,7 +24,7 @@ def test_requires_base_templates():
 
 
 def test_invalid_method_raises():
-    with pytest.raises(ValueError, match="invalid"):
+    with pytest.raises(ValueError, match="Unknown ensemble method"):
         EnsembleModel(base_templates=[object()], method="invalid")
 
 
@@ -59,6 +59,17 @@ def test_inner_validation_windows_match_horizon(weekly_full_data, constant_templ
     assert len(windows) == 2
     for _historic, future in windows:
         assert len(list(future.period_range)) == 3
+
+
+def test_inner_validation_windows_drop_trailing_partial_window(weekly_full_data, constant_template_factory):
+    templates = [constant_template_factory(1.0, 1, "model_a")]
+    model = EnsembleModel(base_templates=templates, method="deterministic", inner_val_periods=10, horizon=4)
+
+    windows = model.inner_validation_windows(weekly_full_data)
+
+    assert len(windows) == 2
+    for _historic, future in windows:
+        assert len(list(future.period_range)) == 4
 
 
 def test_inner_validation_masks_target(weekly_full_data, recording_template_factory):

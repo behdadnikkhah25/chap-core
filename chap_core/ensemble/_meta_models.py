@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any, cast
 
 import numpy as np
 from scipy.optimize import minimize, nnls
@@ -10,10 +11,6 @@ from scipy.optimize import minimize, nnls
 from chap_core.assessment.metrics.crps import crps_matrix
 
 logger = logging.getLogger(__name__)
-
-
-def crps_ensemble(observations: np.ndarray, forecasts: np.ndarray) -> float:
-    return crps_matrix(observations, forecasts)
 
 
 def _vincentize_samples(X_samples: list[np.ndarray], weights: np.ndarray) -> np.ndarray:
@@ -32,11 +29,9 @@ def _vincentize_samples(X_samples: list[np.ndarray], weights: np.ndarray) -> np.
 class NonNegativeMetaModel:
     def __init__(self) -> None:
         self.coef_: np.ndarray | None = None
-        self.intercept_: float = 0.0
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> NonNegativeMetaModel:
-        coef_raw, _ = nnls(X, y)
-        coef = np.asarray(coef_raw, float)
+        coef = cast(np.ndarray, nnls(X, y)[0])  # type: ignore[assignment]
         if not np.any(coef > 0):
             n = coef.shape[0]
             logger.warning("NNLS produced no positive weights; falling back to uniform weights over %d base models", n)
@@ -68,7 +63,6 @@ class ProbabilisticMetaModel:
 
     def __init__(self, verbose: bool = False) -> None:
         self.coef_: np.ndarray | None = None
-        self.intercept_: float = 0.0
         self.verbose = verbose
 
     def fit(self, X_samples: list[np.ndarray], y: np.ndarray) -> ProbabilisticMetaModel:
@@ -97,7 +91,7 @@ class ProbabilisticMetaModel:
             obj,
             w0,
             method="SLSQP",
-            constraints=cons,
+            constraints=cast(Any, cons),
             options={"ftol": 1e-9, "maxiter": 1000},
         )
 
@@ -134,5 +128,4 @@ class ProbabilisticMetaModel:
 __all__ = [
     "NonNegativeMetaModel",
     "ProbabilisticMetaModel",
-    "crps_ensemble",
 ]

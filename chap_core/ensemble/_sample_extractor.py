@@ -80,9 +80,20 @@ class SampleExtractor:
                 )
                 mat = df_pred[sample_cols].to_numpy(float)
             else:
-                df_flat = SampleExtractor.samples_to_flat(preds_ds)
-                merged = df_ref[key_cols].merge(df_flat, on=key_cols, how="left")
-                pts = merged["forecast"].to_numpy()
+                pred_col = "forecast" if "forecast" in df_pred.columns else "value" if "value" in df_pred.columns else None
+                if pred_col is None:
+                    raise ValueError(f"No forecast/value/sample_* in columns: {list(df_pred.columns)}")
+                if len(df_pred) != len(df_ref):
+                    raise ValueError(
+                        f"Cannot align predictions by row order: got {len(df_pred)} prediction rows "
+                        f"for {len(df_ref)} reference rows. Predictions are missing "
+                        f"{', '.join(key_cols)} columns needed for a reliable merge."
+                    )
+                logger.warning(
+                    "Predictions lack %s; falling back to row-order alignment for point forecasts",
+                    ", ".join(key_cols),
+                )
+                pts = df_pred[pred_col].to_numpy(float)
                 logger.warning(
                     "Probabilistic predictions missing samples; repeating point forecasts for %d samples", target_n
                 )

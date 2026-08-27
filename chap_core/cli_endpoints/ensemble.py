@@ -19,10 +19,12 @@ from chap_core.api_types import BacktestParams, RunConfig
 from chap_core.cli_endpoints._common import (
     create_model_lists,
     discover_geojson,
+    get_estimator,
     load_dataset,
     load_dataset_from_csv,
     resolve_csv_path,
     save_results,
+    warn_unused_covariates,
 )
 from chap_core.log_config import initialize_logging
 
@@ -34,6 +36,8 @@ if TYPE_CHECKING:
     from chap_core.database.model_templates_and_config_tables import ModelConfiguration
     from chap_core.ensemble.wrappers import TemplateWithConfig
     from chap_core.spatio_temporal_data.temporal_dataclass import DataSet
+
+from chap_core.external.ExtendedPredictor import ExtendedPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +87,11 @@ def _compute_metrics(flat: Any, ensemble_method: str) -> tuple[str, dict[str, fl
     from chap_core.assessment.metrics import available_metrics
 
     metrics_dict: dict[str, float | str] = {}
-    forecasts_df = pd.DataFrame(cast("Any", flat.forecasts))
+    forecasts_df = pd.DataFrame(cast(Any, flat.forecasts))
     for metric_id, metric_cls in available_metrics.items():
         metric = metric_cls()
         try:
-            df_metric = metric.get_global_metric(flat.observations, cast("Any", forecasts_df))
+            df_metric = metric.get_global_metric(flat.observations, cast(Any, forecasts_df))
             if len(df_metric) == 1:
                 metrics_dict[metric_id] = float(df_metric["metric"].iloc[0])
         except (ValueError, KeyError, TypeError) as exc:
@@ -107,7 +111,7 @@ def _save_reports(
 
 
 def _write_meta_report(report_filename: Path, model_names: list[str], weights: Sequence[float]) -> None:
-    report_path = report_filename.with_name("ensemble_meta_report.csv")
+    report_path = report_filename.with_name(report_filename.stem + "_meta.csv")
     header = "Model," + ",".join(model_names) + "\n"
     row = "ensemble_meta," + ",".join(f"{float(w):.6f}" for w in weights) + "\n"
     report_path.write_text(header + row, encoding="utf-8")
@@ -128,6 +132,7 @@ def _evaluate_ensemble_core(
     run_config: RunConfig,
     model_configuration_yaml: str | None,
     inner_val_periods: int,
+    n_samples: int,
     data_source_mapping: Path | None,
     historical_context_years: int,
     model_template_id: str,
@@ -136,6 +141,9 @@ def _evaluate_ensemble_core(
 ) -> dict[str, tuple[dict[str, float | str], pd.DataFrame]]:
     initialize_logging(run_config.debug, run_config.log_file)
     logger.info("Evaluating ensemble with base models: %s", base_model_names)
+
+    if ensemble_method not in ("deterministic", "probabilistic"):
+        raise ValueError(f"ensemble_method must be 'deterministic' or 'probabilistic', not {ensemble_method!r}")
 
     dataset: DataSet[Any] = _load_dataset(
         dataset_name=dataset_name,
@@ -156,9 +164,6 @@ def _evaluate_ensemble_core(
         n_splits=backtest_params.n_splits,
         stride=backtest_params.stride,
     )
-
-    if ensemble_method not in ("deterministic", "probabilistic"):
-        raise ValueError(f"ensemble_method must be 'deterministic' or 'probabilistic', not {ensemble_method!r}")
 
     logger.info(
         "Backtest config: n_splits=%d, n_periods=%d, stride=%d",
@@ -211,6 +216,31 @@ def _evaluate_ensemble_core(
                 logger.info("Loaded model configuration for %s", name)
 
             base_templates_with_config.append(TemplateWithConfig(template, model_config))
+            warn_unused_covariates(dataset, template.model_template_config, model_config)
+
+            estimator = get_estimator(template, model_config)
+            model_info = estimator.model_information
+            if model_info.min_prediction_length is None and model_info.max_prediction_length is None:
+                logger.warning("Model has not specified minimum and maximum predicted length")
+            if (
+                model_info.min_prediction_length is not None
+                and model_info.min_prediction_length > backtest_params.n_periods
+            ):
+                raise ValueError(
+                    f"The desired prediction length of {backtest_params.n_periods} is less than the model's minimum prediction length of {model_info.min_prediction_length}"
+                )
+            if (
+                model_info.max_prediction_length is not None
+                and model_info.max_prediction_length < backtest_params.n_periods
+            ):
+                logger.warning(
+                    "Base model %s is capped at max prediction length %s; wrapping to %s with iterative prediction extension, which may worsen model performance",
+                    name,
+                    model_info.max_prediction_length,
+                    backtest_params.n_periods,
+                )
+                wrapped_estimator = ExtendedPredictor(estimator, backtest_params.n_periods)
+                template.get_model = lambda _config, _wrapped=wrapped_estimator: (lambda: _wrapped)  # type: ignore[method-assign]
 
         ensemble = EnsembleModel(
             base_templates=base_templates_with_config,
@@ -218,7 +248,7 @@ def _evaluate_ensemble_core(
             inner_val_periods=inner_val_periods,
             horizon=backtest_params.n_periods,
             target_col="disease_cases",
-            n_samples=100,
+            n_samples=n_samples,
         )
 
         model_db = ModelTemplateDB(id=model_template_id, name=model_template_id, version="0.1")
@@ -243,10 +273,10 @@ def _evaluate_ensemble_core(
     logger.info("Saved ensemble NetCDF to %s", eval_nc)
 
     if ensemble.weights is not None:
-        logger.info("Ensemble base model weights (percent): %s", ensemble.weights)
+        logger.info("Ensemble base model weights (final retrain of this run): %s", ensemble.weights)
         try:
             _write_meta_report(report_filename, base_model_list, ensemble.weights.tolist())
-            logger.info("Saved ensemble meta report to %s", report_filename.with_name("ensemble_meta_report.csv"))
+            logger.info("Saved ensemble meta report to %s", report_filename.with_name(report_filename.stem + "_meta.csv"))
         except OSError as exc:
             logger.warning("Failed to write ensemble meta report: %s", exc)
 
@@ -296,6 +326,10 @@ def evaluate_ensemble(
             )
         ),
     ] = 12,
+    n_samples: Annotated[
+        int,
+        Parameter(help="Number of samples used when resampling probabilistic base forecasts."),
+    ] = 100,
     data_source_mapping: Annotated[Path | None, Parameter(help="Optional JSON column mapping.")] = None,
     historical_context_years: Annotated[
         int,
@@ -328,6 +362,7 @@ def evaluate_ensemble(
         run_config=run_config,
         model_configuration_yaml=model_configuration_yaml,
         inner_val_periods=inner_val_periods,
+        n_samples=n_samples,
         data_source_mapping=data_source_mapping,
         historical_context_years=historical_context_years,
         model_template_id="ensemble_model",

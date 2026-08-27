@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path  # noqa: TC003 — used at runtime via cyclopts get_type_hints()
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 from cyclopts import Parameter
 
@@ -236,7 +236,7 @@ def _run_eval(
                 searcher_inp=estimator_options.searcher,
             )
         elif estimator_options.mode == EstimatorMode.ENSEMBLE:
-            raise NotImplementedError("Ensemble mode is not yet implemented")
+            raise NotImplementedError("Ensemble mode is not yet implemented; use `evaluate-ensemble` instead")
 
         warn_unused_covariates(dataset, template.model_template_config, configuration)
 
@@ -281,7 +281,7 @@ def _run_eval(
             from chap_core.assessment.prediction_evaluator import backtest
 
             for _ in backtest(
-                estimator, dataset, backtest_params.n_periods, backtest_params.n_splits, backtest_params.stride
+                cast(Any, estimator), dataset, backtest_params.n_periods, backtest_params.n_splits, backtest_params.stride
             ):
                 pass
             return
@@ -301,7 +301,7 @@ def _run_eval(
             model_name=model_name,
             model_configuration=configuration.model_dump() if configuration else {},
             model_version=template.model_template_config.version or "unknown",
-            model_info=model_info,
+            model_info=cast(Any, model_info),
         )
 
         logger.info(f"Evaluation complete. Results saved to {output_file}")

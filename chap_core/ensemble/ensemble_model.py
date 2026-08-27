@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
@@ -11,7 +12,6 @@ import pandas as pd
 from chap_core.ensemble._meta_models import (
     NonNegativeMetaModel,
     ProbabilisticMetaModel,
-    crps_ensemble,
 )
 from chap_core.ensemble._predictor import EnsemblePredictor
 from chap_core.ensemble._sample_extractor import SampleExtractor as _SampleExtractor
@@ -47,7 +47,7 @@ class EnsembleModel(ConfiguredModel):
         if not self.base_templates:
             raise ValueError("Need at least one base model")
         if method not in ("deterministic", "probabilistic"):
-            raise ValueError(method)
+            raise ValueError("Unknown ensemble method {!r}; expected 'deterministic' or 'probabilistic'".format(method))
         if horizon < 1:
             raise ValueError(f"horizon must be at least 1, got {horizon}")
         self.method = method
@@ -88,9 +88,22 @@ class EnsembleModel(ConfiguredModel):
         if split_idx <= 0 or split_idx >= len(periods):
             raise ValueError("Invalid inner validation split")
 
+        n_val_periods = len(periods) - split_idx
+        n_windows = n_val_periods // self.horizon
+        if n_windows <= 0:
+            raise ValueError(
+                f"Inner validation split leaves no complete windows of horizon {self.horizon}"
+            )
+        dropped_periods = n_val_periods - n_windows * self.horizon
+        if dropped_periods:
+            logger.info(
+                "Dropping %d trailing inner-validation period(s) that do not fill a full horizon window",
+                dropped_periods,
+            )
+
         windows: list[tuple[DataSet, DataSet]] = []
-        for start in range(split_idx, len(periods), self.horizon):
-            stop = min(start + self.horizon, len(periods))
+        for start in range(split_idx, split_idx + n_windows * self.horizon, self.horizon):
+            stop = start + self.horizon
             historic = train_data.restrict_time_period(slice(None, periods[start - 1]))
             future = train_data.restrict_time_period(slice(periods[start], periods[stop - 1]))
             windows.append((historic, future))
@@ -178,17 +191,21 @@ class EnsembleModel(ConfiguredModel):
         if self.method == "probabilistic":
             assert meta_list is not None
             X_clean_samples = [m[mask, :] for m in meta_list]
-            if self.meta_model is None:
-                self.meta_model = ProbabilisticMetaModel(verbose=True)
-            meta_model_prob = cast("ProbabilisticMetaModel", self.meta_model)
+            meta_model_prob = cast(
+                "ProbabilisticMetaModel",
+                copy.deepcopy(self.meta_model) if self.meta_model is not None else ProbabilisticMetaModel(verbose=True),
+            )
             meta_model_prob.fit(X_clean_samples, y_clean)
+            self.meta_model = meta_model_prob
         else:
             assert meta_mat is not None
             X_clean_mat = meta_mat[mask, :]
-            if self.meta_model is None:
-                self.meta_model = NonNegativeMetaModel()
-            meta_model_det = cast("NonNegativeMetaModel", self.meta_model)
+            meta_model_det = cast(
+                "NonNegativeMetaModel",
+                copy.deepcopy(self.meta_model) if self.meta_model is not None else NonNegativeMetaModel(),
+            )
             meta_model_det.fit(X_clean_mat, y_clean)
+            self.meta_model = meta_model_det
 
         assert self.meta_model is not None
         coef_raw = cast("np.ndarray", self.meta_model.coef_)
@@ -198,13 +215,13 @@ class EnsembleModel(ConfiguredModel):
             # Both meta-models fall back to uniform weights rather than returning an
             # all-zero solution, so this should be unreachable.
             raise ValueError("Meta-model produced non-positive weights")
-        self.weights = coef / total * 100.0
+        self.weights = coef
 
         names = self._base_names()
         assert self.weights is not None
-        logger.info("Meta-weights (percent): %s", self.weights)
+        logger.info("Meta-weights: %s", self.weights)
         for name, w in zip(names, self.weights, strict=True):
-            logger.info("  %s: %.2f%%", name, w)
+            logger.info("  %s: %.6f", name, w)
 
         full_ests: list[Any] = []
         for tmpl in self.base_templates:
@@ -279,5 +296,4 @@ __all__ = [
     "EnsembleModel",
     "NonNegativeMetaModel",
     "ProbabilisticMetaModel",
-    "crps_ensemble",
 ]

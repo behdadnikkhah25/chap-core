@@ -60,6 +60,20 @@ def test_reshape_samples_row_order_fallback_checks_length(weekly_full_data):
         SampleExtractor.reshape_samples(truncated, df_ref, 3)
 
 
+def test_reshape_samples_point_forecast_row_order_fallback(weekly_full_data):
+    _, df_ref, samples = _single_location_preds(weekly_full_data)
+
+    class _PointForecastPreds:
+        def to_pandas(self):
+            return df_ref.assign(forecast=np.arange(len(df_ref), dtype=float))[["time_period", "forecast"]]
+
+    actual = SampleExtractor.reshape_samples(_PointForecastPreds(), df_ref, 3)
+
+    expected = np.tile(np.arange(len(df_ref), dtype=float).reshape(-1, 1), (1, 3))
+    assert actual.shape == expected.shape
+    np.testing.assert_allclose(actual, expected)
+
+
 def test_samples_to_flat_uses_median_for_samples(weekly_full_data):
     samples = _samples_from_weekly_data(weekly_full_data)
     location = next(iter(weekly_full_data.locations()))
