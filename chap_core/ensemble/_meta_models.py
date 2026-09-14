@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-from scipy.optimize import minimize, nnls
+from scipy.optimize import minimize
 
 from chap_core.assessment.metrics.crps import crps_matrix
 
@@ -23,26 +23,6 @@ def _vincentize_samples(X_samples: list[np.ndarray], weights: np.ndarray) -> np.
     sorted_stack = np.sort(stacked, axis=2)
     w = np.asarray(weights, float).reshape(-1, 1, 1)
     return np.asarray(np.sum(w * sorted_stack, axis=0), float)
-
-
-class NonNegativeMetaModel:
-    def __init__(self) -> None:
-        self.coef_: np.ndarray | None = None
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> NonNegativeMetaModel:
-        coef_raw, _ = nnls(X, y)
-        coef = np.asarray(coef_raw, float)
-        if not np.any(coef > 0):
-            n = coef.shape[0]
-            logger.warning("NNLS produced no positive weights; falling back to uniform weights over %d base models", n)
-            coef = np.ones(n, dtype=float) / n
-        self.coef_ = coef
-        return self
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        if self.coef_ is None:
-            raise ValueError("Meta-model not fitted")
-        return np.asarray(np.dot(X, self.coef_), float)
 
 
 class ProbabilisticMetaModel:
@@ -91,7 +71,7 @@ class ProbabilisticMetaModel:
             obj,
             w0,
             method="SLSQP",
-            constraints=cons,
+            constraints=cons,  # type: ignore[arg-type]
             options={"ftol": 1e-9, "maxiter": 1000},
         )
 
@@ -126,6 +106,5 @@ class ProbabilisticMetaModel:
 
 
 __all__ = [
-    "NonNegativeMetaModel",
     "ProbabilisticMetaModel",
 ]

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from chap_core.ensemble._meta_models import NonNegativeMetaModel, ProbabilisticMetaModel
+from chap_core.ensemble._meta_models import ProbabilisticMetaModel
 
 
 def _base_series_from_weekly_data(weekly_full_data):
@@ -9,31 +9,6 @@ def _base_series_from_weekly_data(weekly_full_data):
     series = weekly_full_data[location]
     base = np.asarray(series.disease_cases, float)
     return base[np.isfinite(base)]
-
-
-def test_non_negative_meta_model_fits_and_predicts(weekly_full_data):
-    base = _base_series_from_weekly_data(weekly_full_data)
-    X = np.column_stack([base, base + 1.0])
-    y = base + 0.5
-
-    model = NonNegativeMetaModel().fit(X, y)
-    preds = model.predict(X)
-
-    assert model.coef_ is not None
-    assert np.all(model.coef_ >= 0)
-    assert preds.shape == y.shape
-
-
-def test_non_negative_meta_model_keeps_nnls_scale():
-    X = np.array([[1.0, 0.0], [0.0, 1.0]])
-    y = np.array([2.0, 2.0])
-
-    model = NonNegativeMetaModel().fit(X, y)
-
-    assert model.coef_ is not None
-    assert np.allclose(model.coef_, np.array([2.0, 2.0]))
-    preds = model.predict(X)
-    assert np.allclose(preds, y)
 
 
 def test_probabilistic_meta_model_weights_on_simplex(weekly_full_data):

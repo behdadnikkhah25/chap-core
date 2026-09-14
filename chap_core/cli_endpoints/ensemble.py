@@ -79,25 +79,25 @@ def _load_dataset(
     return load_dataset_from_csv(csv_path, geojson, column_mapping)
 
 
-def _compute_metrics(flat: Any, ensemble_method: str) -> tuple[str, dict[str, float | str], pd.DataFrame]:
+def _compute_metrics(flat: Any) -> tuple[str, dict[str, float | str], pd.DataFrame]:
     import pandas as pd
 
     from chap_core.assessment.metrics import available_metrics
 
     metrics_dict: dict[str, float | str] = {}
-    forecasts_df = pd.DataFrame(cast("Any", flat.forecasts))
+    forecasts_df = pd.DataFrame(flat.forecasts)
     for metric_id, metric_cls in available_metrics.items():
         metric = metric_cls()
         try:
-            df_metric = metric.get_global_metric(flat.observations, cast("Any", forecasts_df))
+            df_metric = metric.get_global_metric(flat.observations, forecasts_df)
             if len(df_metric) == 1:
                 metrics_dict[metric_id] = float(df_metric["metric"].iloc[0])
         except (ValueError, KeyError, TypeError) as exc:
             logger.warning("Failed to compute metric %s: %s", metric_id, exc)
 
-    model_key = f"ensemble_{ensemble_method}"
+    model_key = "ensemble_probabilistic"
     metrics_dict["model_name"] = model_key
-    metrics_dict["ensemble_method"] = ensemble_method
+    metrics_dict["ensemble_method"] = "probabilistic"
     return model_key, metrics_dict, forecasts_df
 
 
@@ -119,10 +119,8 @@ def _write_meta_report(
     directory with different ``--report-filename`` clobber each other's weights while
     their other outputs stayed distinct.
 
-    The deterministic meta-model applies the raw coefficients, whose sum need not be 1,
-    so reporting only the normalised shares would hide the scaling. Backtests with
-    ``n_retrain > 1`` fit the meta-model more than once, and every round is recorded
-    rather than only the last.
+    Probabilistic stacking fits the meta-model more than once when ``n_retrain > 1``,
+    and every round is recorded rather than only the last.
     """
     report_path = report_filename.with_name(f"{report_filename.stem}_meta.csv")
     lines = ["Model,round,quantity," + ",".join(model_names)]
@@ -175,7 +173,6 @@ def _prepare_base_template(
 def _evaluate_ensemble_core(
     *,
     base_model_names: str,
-    ensemble_method: str,
     dataset_name: str | None,
     dataset_country: str | None,
     dataset_csv: str | Path | None,
@@ -195,10 +192,6 @@ def _evaluate_ensemble_core(
     backtest_name: str,
 ) -> dict[str, tuple[dict[str, float | str], pd.DataFrame]]:
     initialize_logging(run_config.debug, run_config.log_file)
-    # Validated before the dataset is loaded: loading may download a remote CSV plus a
-    # companion GeoJSON, which is a long wait to pay for a typo in --ensemble-method.
-    if ensemble_method not in ("deterministic", "probabilistic"):
-        raise ValueError(f"ensemble_method must be 'deterministic' or 'probabilistic', not {ensemble_method!r}")
     if n_samples < 1:
         raise ValueError(f"n_samples must be at least 1, got {n_samples}")
     logger.info("Evaluating ensemble with base models: %s", base_model_names)
@@ -278,7 +271,6 @@ def _evaluate_ensemble_core(
 
         ensemble = EnsembleModel(
             base_templates=base_templates_with_config,
-            method=ensemble_method,
             inner_val_periods=inner_val_periods,
             horizon=backtest_params.n_periods,
             target_col="disease_cases",
@@ -316,7 +308,7 @@ def _evaluate_ensemble_core(
             logger.warning("Failed to write ensemble meta report: %s", exc)
 
     flat = evaluation.to_flat()
-    model_key, metrics_dict, forecasts_df = _compute_metrics(flat, ensemble_method)
+    model_key, metrics_dict, forecasts_df = _compute_metrics(flat)
     results: dict[str, tuple[dict[str, float | str], pd.DataFrame]] = {model_key: (metrics_dict, forecasts_df)}
     _save_reports(report_filename, cast("dict[str, tuple[dict[str, float | str], object]]", results))
     return results
@@ -327,10 +319,6 @@ def evaluate_ensemble(
         str,
         Parameter(help="Comma-separated list of base models (local folders or GitHub URLs)."),
     ],
-    ensemble_method: Annotated[
-        str,
-        Parameter(help="Ensemble method: 'deterministic' or 'probabilistic'."),
-    ] = "probabilistic",
     dataset_name: Annotated[str | None, Parameter(help="Name of a built-in dataset.")] = None,
     dataset_country: Annotated[str | None, Parameter(help="Country for multi-country datasets.")] = None,
     dataset_csv: Annotated[str | None, Parameter(help="CSV file with disease data.")] = None,
@@ -383,15 +371,14 @@ def evaluate_ensemble(
     or be removed in any release, and the results should not yet be relied on for
     production evaluations.
 
-    Trains the base models on an inner split of the training data, fits ensemble
-    weights on the held-out windows, then backtests the combined model. Base models
-    are given as a comma-separated list of local folders or GitHub URLs, optionally
-    paired with a matching list of configuration YAML files.
+    Trains the base models on an inner split of the training data, fits probabilistic
+    ensemble weights on the held-out windows, then backtests the combined model.
+    Base models are given as a comma-separated list of local folders or GitHub URLs,
+    optionally paired with a matching list of configuration YAML files.
     """
     logger.warning("evaluate-ensemble is EXPERIMENTAL: its interface and results may change without notice")
     return _evaluate_ensemble_core(
         base_model_names=base_model_names,
-        ensemble_method=ensemble_method,
         dataset_name=dataset_name,
         dataset_country=dataset_country,
         dataset_csv=dataset_csv,
@@ -414,3 +401,5 @@ def evaluate_ensemble(
 
 def register_commands(app):
     app.command(name="evaluate-ensemble")(evaluate_ensemble)
+
+
