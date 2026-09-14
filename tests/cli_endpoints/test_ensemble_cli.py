@@ -32,7 +32,7 @@ class _ConstantModel:
         for loc in future_data.locations():
             tp = future_data[loc].time_period
             vals = np.full(len(tp), self._value, dtype=float)
-            result[loc] = Samples(tp, vals.reshape(-1, 1))
+            result[loc] = Samples(time_period=tp, samples=vals.reshape(-1, 1))
         return DataSet(result)
 
 
@@ -93,7 +93,6 @@ def _install_templates(monkeypatch, weekly_full_data, config_for_name) -> list[_
 def _run(report_path, **overrides):
     kwargs = dict(
         base_model_names="model_a,model_b",
-        ensemble_method="deterministic",
         dataset_name=None,
         dataset_country=None,
         dataset_csv=None,
@@ -129,7 +128,7 @@ def test_evaluate_ensemble_smoke(weekly_full_data, tmp_path, monkeypatch):
 
 
 def test_meta_report_follows_report_stem_and_keeps_coefficients(weekly_full_data, tmp_path, monkeypatch):
-    """A fixed meta report name let two runs in one directory clobber each other's weights."""
+    """A fixed meta report name would let two runs in one directory clobber each other's weights."""
     _install_templates(
         monkeypatch,
         weekly_full_data,
@@ -144,8 +143,6 @@ def test_meta_report_follows_report_stem_and_keeps_coefficients(weekly_full_data
     lines = meta_path.read_text(encoding="utf-8").strip().split("\n")
     assert lines[0] == "Model,round,quantity,model_a,model_b"
     quantities = [line.split(",")[2] for line in lines[1:]]
-    # The deterministic meta-model applies the raw coefficients, not the normalised
-    # shares, so both have to be reported.
     assert quantities == ["weight_percent", "coefficient"]
 
 
