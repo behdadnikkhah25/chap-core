@@ -221,9 +221,7 @@ class EnsembleEstimator(EnsembleModel):
         horizon: int = 3,
         meta_model: ProbabilisticMetaModel | None = None,
         n_samples: int = 100,
-        **kwargs: Any,
     ) -> None:
-        del kwargs
         specs = list(base_model_specs or [])
         if base_model_templates is not None:
             specs.extend(BaseModelSpec(template=t, config=None) for t in base_model_templates)

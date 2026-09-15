@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from chap_core.ensemble._meta_models import ProbabilisticMetaModel
 from chap_core.ensemble._predictor import EnsemblePredictor
@@ -32,3 +33,21 @@ def test_predictor_probabilistic_samples(weekly_full_data, constant_predictor_fa
         samples = preds[loc].samples
         assert samples.shape[1] == 4
         assert samples.shape[0] == len(weekly_full_data[loc].time_period)
+
+
+def test_predictor_probabilistic_missing_rows_raises(weekly_full_data, constant_predictor_factory):
+    """Regression test: verify that truncated base predictions fail explicitly in probabilistic mode."""
+    # First predictor returns NaN: missing base predictions
+    predictors = [constant_predictor_factory(np.nan, 2), constant_predictor_factory(1.0, 2)]
+    meta = _FixedMetaProbabilistic([0.5, 0.5])
+
+    predictor = EnsemblePredictor(
+        predictors=predictors,
+        meta=meta,
+        n_samples=4,
+    )
+
+    with pytest.raises(ValueError, match="Missing base model predictions"):
+        predictor.predict(weekly_full_data, weekly_full_data)
+
+
