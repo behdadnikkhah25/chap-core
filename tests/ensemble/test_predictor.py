@@ -49,5 +49,3 @@ def test_predictor_probabilistic_missing_rows_raises(weekly_full_data, constant_
 
     with pytest.raises(ValueError, match="Missing base model predictions"):
         predictor.predict(weekly_full_data, weekly_full_data)
-
-

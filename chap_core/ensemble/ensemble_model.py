@@ -29,13 +29,13 @@ class EnsembleModel(ConfiguredModel):
         return None
 
     def __init__(
-        self,
-        base_templates: Sequence[Any] | None = None,
-        inner_val_periods: int = 12,
-        horizon: int = 3,
-        target_col: str = "disease_cases",
-        n_samples: int = 100,
-        meta_model: ProbabilisticMetaModel | None = None,
+            self,
+            base_templates: Sequence[Any] | None = None,
+            inner_val_periods: int = 12,
+            horizon: int = 3,
+            target_col: str = "disease_cases",
+            n_samples: int = 100,
+            meta_model: ProbabilisticMetaModel | None = None,
     ) -> None:
         super().__init__()
         self.base_templates = list(base_templates or [])
@@ -213,14 +213,14 @@ class EnsembleEstimator(EnsembleModel):
     """Legacy class name/API backed by the same core implementation."""
 
     def __init__(
-        self,
-        base_model_templates: list[Any] | None = None,
-        base_model_specs: Sequence[BaseModelSpec] | None = None,
-        target_column: str = "disease_cases",
-        inner_val_periods: int = 12,
-        horizon: int = 3,
-        meta_model: ProbabilisticMetaModel | None = None,
-        n_samples: int = 100,
+            self,
+            base_model_templates: list[Any] | None = None,
+            base_model_specs: Sequence[BaseModelSpec] | None = None,
+            target_column: str = "disease_cases",
+            inner_val_periods: int = 12,
+            horizon: int = 3,
+            meta_model: ProbabilisticMetaModel | None = None,
+            n_samples: int = 100,
     ) -> None:
         specs = list(base_model_specs or [])
         if base_model_templates is not None:
