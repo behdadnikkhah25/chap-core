@@ -60,6 +60,7 @@ from chap_core.exceptions import ModelTemplateRevisionConflict
 from chap_core.geometry import Polygons
 from chap_core.rest_api.celery_tasks import (
     JOB_NAME_KW,
+    JOB_REQUEST_KW,
     JOB_TYPE_KW,
     PREDICTION_SETUP_ID_JOB_META_KEY,
     CeleryPool,
@@ -89,7 +90,7 @@ from ...data_models import (
     RunPredictionSetupRequest,
 )
 from .analytics import validate_full_dataset
-from .dependencies import get_database_url, get_session, get_settings
+from .dependencies import get_database_url, get_job_request, get_session, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,9 @@ def _registered_chapkit_revision_conflict(
     return None
 
 
-def _sync_live_chapkit_services(session: Session, orchestrator=None) -> dict[str, ModelTemplateRevisionConflict | None]:
+def _sync_live_chapkit_services(
+    session: Session, orchestrator=None
+) -> dict[tuple[str, str], ModelTemplateRevisionConflict | None]:
     """Sync live chapkit services from the v2 registry into the DB.
 
     Queries the Redis-backed Orchestrator for registered services and
@@ -138,7 +141,7 @@ def _sync_live_chapkit_services(session: Session, orchestrator=None) -> dict[str
     second redis connection, which costs a full connect timeout whenever
     redis is unreachable.
 
-    Returns the revision conflict per registered template name, or None when the
+    Returns the revision conflict per registered (template name, version), or None when the
     service runs the stored source revision. A mismatched template is left untouched.
     """
     try:
@@ -151,7 +154,9 @@ def _sync_live_chapkit_services(session: Session, orchestrator=None) -> dict[str
         logger.debug("Could not reach service registry, skipping chapkit sync")
         return {}
 
-    conflicts: dict[str, ModelTemplateRevisionConflict | None] = {s.info.id: None for s in service_list.services}
+    conflicts: dict[tuple[str, str], ModelTemplateRevisionConflict | None] = {
+        (s.info.id, s.info.version): None for s in service_list.services
+    }
 
     if service_list.count > 0:
         from chap_core.models.chapkit_rest_api_wrapper import CHAPKitRestAPIWrapper
@@ -196,10 +201,13 @@ def _sync_live_chapkit_services(session: Session, orchestrator=None) -> dict[str
                     session.commit()
                 if conflict is not None:
                     logger.warning(str(conflict))
-                    conflicts[service.info.id] = conflict
+                    conflicts[(service.info.id, service.info.version)] = conflict
                     continue
                 _sync_chapkit_configured_models(session_wrapper, template_id, service.url, CHAPKitRestAPIWrapper)
             except Exception:
+                # Roll back so a failed database write does not poison the session for the
+                # remaining services and the archival step below.
+                session.rollback()
                 logger.warning("Failed to sync chapkit service %s", service.id, exc_info=True)
 
     _archive_stale_chapkit_templates(session, service_list)
@@ -752,7 +760,10 @@ async def get_dataset(dataset_id: Annotated[int, Path(alias="datasetId")], sessi
     summary="Import a health-only dataset",
 )
 async def create_dataset(
-    data: DatasetCreate, datababase_url=Depends(get_database_url), worker_settings=Depends(get_settings)
+    data: DatasetCreate,
+    original_request: dict = Depends(get_job_request),
+    datababase_url=Depends(get_database_url),
+    worker_settings=Depends(get_settings),
 ) -> JobResponse:
     """Import a dataset that carries just disease cases and population (no climate covariates inline), with polygons attached.
 
@@ -770,6 +781,7 @@ async def create_dataset(
         data.name,
         database_url=datababase_url,
         worker_config=worker_settings,
+        **{JOB_REQUEST_KW: original_request},
     )
     return JobResponse(id=job.id)
 
@@ -894,8 +906,8 @@ async def list_model_templates(session: Session = Depends(get_session)):
     results = []
     for t in model_templates:
         read = ModelTemplateRead.model_validate(t)
-        if t.name in conflicts:
-            read.health_status = LIVE if conflicts[t.name] is None else REVISION_MISMATCH
+        if (t.name, t.version) in conflicts:
+            read.health_status = LIVE if conflicts[(t.name, t.version)] is None else REVISION_MISMATCH
         results.append(read)
     return results
 
@@ -1138,7 +1150,7 @@ def _cancel_jobs_for_prediction_setup(prediction_setup_id: int) -> None:
                 logger.warning(
                     "Failed to cancel job %s for prediction setup %d", task_id, prediction_setup_id, exc_info=True
                 )
-        redis.delete(key)
+        redis.delete(key, f"job_request:{task_id}")
 
 
 @router.delete(
@@ -1181,6 +1193,7 @@ async def delete_prediction_setup(
 async def run_prediction_setup(
     prediction_setup_id: Annotated[int, Path(alias="predictionSetupId")],
     request: RunPredictionSetupRequest,
+    original_request: dict = Depends(get_job_request),
     session: Session = Depends(get_session),
     database_url: str = Depends(get_database_url),
     worker_settings=Depends(get_settings),
@@ -1258,6 +1271,6 @@ async def run_prediction_setup(
         configured_model_id=setup.configured_model_id,
         database_url=database_url,
         worker_config=worker_settings,
-        **{JOB_TYPE_KW: JobType.PREDICTION, JOB_NAME_KW: request.name},
+        **{JOB_REQUEST_KW: original_request, JOB_TYPE_KW: JobType.PREDICTION, JOB_NAME_KW: request.name},
     )
     return JobResponse(id=job.id)
