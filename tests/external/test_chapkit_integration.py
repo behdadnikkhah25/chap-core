@@ -760,6 +760,25 @@ class TestFailedRunOutput:
         assert self.STDERR in str(exc_info.value)
         assert artifact_calls == [f"/api/v1/artifacts/{VALID_ULID_3}"]
 
+    def test_successful_train_logs_model_output_at_debug_level(self, train_data, caplog):
+        artifact = _workspace_artifact_json({**self.METADATA, "status": "success", "stdout": "Model formula: y ~ x"})
+        model = self._model(self._handler(httpx.Response(200, json=artifact), "completed"))
+
+        with caplog.at_level(logging.DEBUG, logger="chap_core.models.external_chapkit_model"):
+            model.train(train_data)
+
+        assert "Model formula: y ~ x" in caplog.text
+
+    def test_successful_train_skips_the_artifact_fetch_without_debug_logging(self, train_data, caplog):
+        artifact_calls: list[str] = []
+        artifact = _workspace_artifact_json({**self.METADATA, "status": "success", "stdout": "Model formula: y ~ x"})
+        model = self._model(self._handler(httpx.Response(200, json=artifact), "completed", artifact_calls))
+
+        with caplog.at_level(logging.INFO, logger="chap_core.models.external_chapkit_model"):
+            model.train(train_data)
+
+        assert artifact_calls == []
+
     def test_train_failure_survives_unreadable_artifact(self, train_data):
         model = self._model(self._handler(httpx.Response(404, json={"title": "Not Found", "status": 404})))
 
@@ -991,6 +1010,11 @@ class TestConfigPayload:
     @staticmethod
     def _created_config(model_configuration, store=lambda data: data) -> dict:
         """Build a model and return the config chap-core posted; ``store`` is what the service keeps of the data."""
+        return TestConfigPayload._build(model_configuration, store)[0]
+
+    @staticmethod
+    def _build(model_configuration, store=lambda data: data):
+        """Build a model and return the config chap-core posted together with the model."""
         created: list[dict] = []
 
         def handler(request):
@@ -1008,8 +1032,8 @@ class TestConfigPayload:
 
         template = ExternalChapkitModelTemplate("http://chapkit.test")
         template.client = _mock_wrapper(handler)
-        template.get_model(model_configuration)
-        return created[0]
+        model = template.get_model(model_configuration)
+        return created[0], model
 
     def test_configured_model_row_sends_only_configuration_fields(self):
         row = ConfiguredModelDB(
@@ -1033,8 +1057,31 @@ class TestConfigPayload:
             uses_chapkit=True,
         )
 
-        with pytest.raises(ValueError, match="max_epochs: sent 2, stored None"):
+        with pytest.raises(ValueError, match="did not store these model configuration options: max_epochs"):
             self._created_config(row, store=lambda data: {"prediction_periods": 3})
+
+    def test_configuration_value_the_service_converted_raises_a_type_error_message(self):
+        row = ConfiguredModelDB(
+            name="test-model",
+            model_template_id=1,
+            user_option_values={"max_epochs": "yes"},
+            uses_chapkit=True,
+        )
+
+        with pytest.raises(ValueError, match="max_epochs: sent 'yes', stored True") as error:
+            self._created_config(row, store=lambda data: {**data, "max_epochs": True})
+        assert "chapkit >=" not in str(error.value)
+
+    def test_model_reports_the_covariates_the_service_stored(self):
+        from chap_core.database.model_templates_and_config_tables import ModelConfiguration
+
+        service_default = ["rainfall", "mean_temperature"]
+        _, model = self._build(
+            ModelConfiguration(),
+            store=lambda data: {**data, "additional_continuous_covariates": service_default},
+        )
+
+        assert model.additional_continuous_covariates == service_default
 
     def test_empty_configuration_sends_no_data(self):
         from chap_core.database.model_templates_and_config_tables import ModelConfiguration
